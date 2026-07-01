@@ -29,11 +29,11 @@ from videox_fun.models import AutoencoderKLWan, WanT5EncoderModel, WanTransforme
 from videox_fun.pipeline import WanPipeline
 from videox_fun.utils.lora_utils import merge_lora
 from videox_fun.utils.singleturn_utils import (
-    DEFAULT_SINGLETURN_PROMPT_TEMPLATE,
+    CORNE_SINGLETURN_PROMPT,
     generate_singleturn_sample,
     generate_singleturn_sample_from_latents,
     normalize_singleturn_sample_size,
-    preprocess_singleturn_image,
+    preprocess_singleturn_conditioning_image,
     save_singleturn_outputs,
 )
 from videox_fun.utils.utils import filter_kwargs
@@ -89,8 +89,32 @@ def _load_shared_prompt_cache(shared_prompt_cache: str):
     return {
         "prompt_embeds": payload["prompt_embeds"],
         "prompt_seq_len": int(payload["prompt_seq_len"]),
-        "text": payload.get("text", ""),
-        "formatted_text": payload.get("formatted_text", payload.get("text", "")),
+        "text": payload.get("text", CORNE_SINGLETURN_PROMPT),
+        "formatted_text": payload.get("formatted_text", payload.get("text", CORNE_SINGLETURN_PROMPT)),
+    }
+
+
+def _encode_fixed_prompt(tokenizer, text_encoder, device: torch.device, weight_dtype: torch.dtype, tokenizer_max_length: int = 512):
+    with torch.no_grad():
+        prompt_ids = tokenizer(
+            [CORNE_SINGLETURN_PROMPT],
+            padding="max_length",
+            max_length=tokenizer_max_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        prompt_attention_mask = prompt_ids.attention_mask
+        prompt_embeds = text_encoder(
+            prompt_ids.input_ids.to(device),
+            attention_mask=prompt_attention_mask.to(device),
+        )[0][0].detach().cpu().to(weight_dtype)
+        prompt_seq_len = int(prompt_attention_mask.gt(0).sum(dim=1)[0].item())
+    return {
+        "prompt_embeds": prompt_embeds,
+        "prompt_seq_len": prompt_seq_len,
+        "text": CORNE_SINGLETURN_PROMPT,
+        "formatted_text": CORNE_SINGLETURN_PROMPT,
     }
 
 
@@ -120,11 +144,9 @@ def _save_singleturn_result(
     fps: int,
 ):
     os.makedirs(output_dir, exist_ok=True)
-    full_frames = generation["full_frames"]
-    tail_frames = generation["tail_frames"]
     output_paths = save_singleturn_outputs(
-        full_frames=full_frames,
-        tail_frames=tail_frames,
+        full_frames=generation["full_frames"],
+        tail_frames=generation["tail_frames"],
         output_dir=output_dir,
         stem=stem,
         fps=fps,
@@ -138,7 +160,7 @@ def _save_singleturn_result(
 
 
 def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
-    source_tensor = preprocess_singleturn_image(args.image_path, args.sample_size).to(
+    source_tensor = preprocess_singleturn_conditioning_image(args.image_path, args.mask_path, args.sample_size).to(
         device=pipeline._execution_device,
         dtype=weight_dtype,
     )
@@ -147,8 +169,6 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
         generation = generate_singleturn_sample(
             pipeline=pipeline,
             source_tensor=source_tensor,
-            prompt=args.prompt,
-            prompt_template=args.prompt_template,
             negative_prompt=args.negative_prompt,
             guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps,
@@ -164,8 +184,9 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
         metadata={
             "mode": "image",
             "image_path": args.image_path,
-            "prompt": args.prompt,
-            "formatted_prompt": generation["formatted_prompt"],
+            "mask_path": args.mask_path,
+            "prompt": CORNE_SINGLETURN_PROMPT,
+            "formatted_prompt": CORNE_SINGLETURN_PROMPT,
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
@@ -184,23 +205,16 @@ def _run_singleturn_cached_sample(
     weight_dtype,
     generator,
     sample,
+    prompt_cache,
     output_dir: str,
     stem: str,
 ):
-    source_latent = sample["source_latent_mean"]
-    prompt_embeds = sample["prompt_embeds"]
-    prompt_seq_len = sample["prompt_seq_len"]
-    if torch.is_tensor(prompt_seq_len) and prompt_seq_len.ndim == 1 and prompt_seq_len.numel() == 1:
-        prompt_seq_len = int(prompt_seq_len[0].item())
-    elif torch.is_tensor(prompt_seq_len) and prompt_seq_len.ndim == 0:
-        prompt_seq_len = int(prompt_seq_len.item())
-
     with torch.no_grad():
         generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
-            source_latent=source_latent,
-            prompt_embeds=prompt_embeds,
-            prompt_seq_len=prompt_seq_len,
+            source_latent=sample["first_frame_latent"],
+            prompt_embeds=prompt_cache["prompt_embeds"],
+            prompt_seq_len=prompt_cache["prompt_seq_len"],
             negative_prompt=args.negative_prompt,
             guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps,
@@ -208,8 +222,6 @@ def _run_singleturn_cached_sample(
             weight_dtype=weight_dtype,
         )
 
-    raw_prompt = sample.get("text", "")
-    formatted_prompt = sample.get("formatted_text", raw_prompt)
     output_paths, metadata_path = _save_singleturn_result(
         output_dir=output_dir,
         stem=stem,
@@ -218,9 +230,12 @@ def _run_singleturn_cached_sample(
             "mode": "cache",
             "cache_path": sample.get("cache_path", ""),
             "source_image": sample.get("source_image", ""),
-            "edited_image": sample.get("edited_image", ""),
-            "prompt": raw_prompt,
-            "formatted_prompt": formatted_prompt,
+            "bg_image": sample.get("bg_image", ""),
+            "mask_check_image": sample.get("mask_check_image", ""),
+            "mask_sam_image": sample.get("mask_sam_image", ""),
+            "used_mask_sam": bool(sample.get("used_mask_sam", False)),
+            "prompt": prompt_cache["text"],
+            "formatted_prompt": prompt_cache["formatted_text"],
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
@@ -235,35 +250,43 @@ def _run_singleturn_cached_sample(
         "stem": stem,
         "cache_path": sample.get("cache_path", ""),
         "source_image": sample.get("source_image", ""),
-        "prompt": raw_prompt,
-        "formatted_prompt": formatted_prompt,
+        "mask_check_image": sample.get("mask_check_image", ""),
+        "used_mask_sam": bool(sample.get("used_mask_sam", False)),
+        "formatted_prompt": prompt_cache["formatted_text"],
     }
 
 
-def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator):
+def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default_prompt_cache):
     cached_data_dir = _resolve_cached_data_dir(args)
     local_rank, world_size = _get_distributed_context()
     results = []
-    shared_prompt_cache = None
+    shared_prompt_cache = default_prompt_cache
     if args.shared_prompt_cache is not None:
         shared_prompt_cache = _load_shared_prompt_cache(args.shared_prompt_cache)
 
     if args.cached_sample_path is not None:
         cache_path = _resolve_cache_path(args.cached_sample_path, cached_data_dir)
         payload = load_singleturn_cache_payload(cache_path)
+        if "source_latent_mean" in payload or "target_latent_mean" in payload:
+            raise ValueError(
+                f"Cached SingleTurn sample {cache_path} uses the deprecated instructpix2pix posterior payload. "
+                "Re-run CORNE object-removal preprocess."
+            )
+        if "first_frame_latent" not in payload:
+            raise ValueError(f"Cached SingleTurn sample {cache_path} is missing first_frame_latent.")
+
+        prompt_cache = shared_prompt_cache
+        if args.shared_prompt_cache is None and payload.get("shared_prompt_cache") is not None:
+            prompt_cache = _load_shared_prompt_cache(_resolve_cache_path(payload["shared_prompt_cache"], cached_data_dir))
+
         sample = {
-            "source_latent_mean": payload["source_latent_mean"],
-            "prompt_embeds": shared_prompt_cache["prompt_embeds"] if shared_prompt_cache is not None else payload["prompt_embeds"],
-            "prompt_seq_len": shared_prompt_cache["prompt_seq_len"] if shared_prompt_cache is not None else int(payload["prompt_seq_len"]),
-            "text": shared_prompt_cache["text"] if shared_prompt_cache is not None else payload.get("text", ""),
-            "formatted_text": (
-                shared_prompt_cache["formatted_text"]
-                if shared_prompt_cache is not None
-                else payload.get("formatted_text", payload.get("text", ""))
-            ),
+            "first_frame_latent": payload["first_frame_latent"],
             "cache_path": cache_path,
             "source_image": payload.get("source_image", ""),
-            "edited_image": payload.get("edited_image", ""),
+            "bg_image": payload.get("bg_image", ""),
+            "mask_check_image": payload.get("mask_check_image", ""),
+            "mask_sam_image": payload.get("mask_sam_image", ""),
+            "used_mask_sam": bool(payload.get("used_mask_sam", False)),
             "idx": 0,
         }
         output_name = args.output_name or Path(cache_path).stem
@@ -275,6 +298,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator):
                 weight_dtype=weight_dtype,
                 generator=generator,
                 sample=sample,
+                prompt_cache=prompt_cache,
                 output_dir=sample_output_dir,
                 stem="singleturn",
             )
@@ -322,21 +346,23 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator):
             sample_output_root = args.output_dir if world_size == 1 else os.path.join(args.output_dir, f"rank{local_rank}")
             sample_output_dir = os.path.join(sample_output_root, sample_dir_name)
 
+            prompt_cache = shared_prompt_cache
+            if args.shared_prompt_cache is None:
+                prompt_cache = {
+                    "prompt_embeds": batch["prompt_embeds"],
+                    "prompt_seq_len": int(_first_item(batch["prompt_seq_len"])),
+                    "text": _first_item(batch["text"]),
+                    "formatted_text": _first_item(batch["formatted_text"]),
+                }
+
             sample = {
-                "source_latent_mean": batch["source_latent_mean"],
-                "prompt_embeds": shared_prompt_cache["prompt_embeds"] if shared_prompt_cache is not None else batch["prompt_embeds"],
-                "prompt_seq_len": (
-                    shared_prompt_cache["prompt_seq_len"] if shared_prompt_cache is not None else batch["prompt_seq_len"]
-                ),
-                "text": shared_prompt_cache["text"] if shared_prompt_cache is not None else _first_item(batch["text"]),
-                "formatted_text": (
-                    shared_prompt_cache["formatted_text"]
-                    if shared_prompt_cache is not None
-                    else _first_item(batch["formatted_text"])
-                ),
+                "first_frame_latent": batch["first_frame_latent"],
                 "cache_path": cache_path,
                 "source_image": _first_item(batch["source_image"]),
-                "edited_image": _first_item(batch["edited_image"]),
+                "bg_image": _first_item(batch["bg_image"]),
+                "mask_check_image": _first_item(batch["mask_check_image"]),
+                "mask_sam_image": _first_item(batch["mask_sam_image"]),
+                "used_mask_sam": bool(_first_item(batch["used_mask_sam"])),
                 "idx": batch_index,
             }
 
@@ -347,6 +373,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator):
                     weight_dtype=weight_dtype,
                     generator=generator,
                     sample=sample,
+                    prompt_cache=prompt_cache,
                     output_dir=sample_output_dir,
                     stem="singleturn",
                 )
@@ -362,14 +389,15 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="SingleTurn Wan LoRA image editing inference")
+    parser = argparse.ArgumentParser(description="SingleTurn CORNE object-removal inference")
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True, help="Base Wan model path.")
     parser.add_argument("--image_path", type=str, default=None, help="Source image path for direct image-mode inference.")
-    parser.add_argument("--prompt", type=str, default=None, help="Edit instruction for direct image-mode inference.")
+    parser.add_argument("--mask_path", type=str, default=None, help="Mask path for direct image-mode inference.")
+    parser.add_argument("--prompt", type=str, default=None, help="Deprecated and ignored. Prompt is fixed for CORNE object-removal mode.")
     parser.add_argument("--cached_sample_path", type=str, default=None, help="Path to one cached SingleTurn sample (.pt).")
     parser.add_argument("--cached_data_meta", type=str, default=None, help="Manifest for cached SingleTurn samples.")
     parser.add_argument("--cached_data_dir", type=str, default=None, help="Root directory used to resolve relative cache paths.")
-    parser.add_argument("--shared_prompt_cache", type=str, default=None, help="Optional shared prompt embedding cache that overrides per-sample cached prompts.")
+    parser.add_argument("--shared_prompt_cache", type=str, default=None, help="Optional shared prompt embedding cache.")
     parser.add_argument("--cached_start_index", type=int, default=0, help="Start index when iterating over cached manifests.")
     parser.add_argument("--cached_num_samples", type=int, default=None, help="Optional limit when iterating over cached manifests.")
     parser.add_argument("--cached_num_workers", type=int, default=2, help="CPU workers used to load cached samples.")
@@ -379,12 +407,6 @@ def parse_args():
     parser.add_argument("--config_path", type=str, default="config/wan2.1/wan_civitai.yaml", help="Wan config path.")
     parser.add_argument("--lora_path", type=str, default=None, help="Optional LoRA checkpoint.")
     parser.add_argument("--lora_alpha", type=float, default=1.0, help="LoRA merge multiplier.")
-    parser.add_argument(
-        "--prompt_template",
-        type=str,
-        default=DEFAULT_SINGLETURN_PROMPT_TEMPLATE,
-        help="Prompt template; must contain '{prompt}'.",
-    )
     parser.add_argument("--negative_prompt", type=str, default="", help="Optional negative prompt.")
     parser.add_argument("--guidance_scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of denoising steps.")
@@ -392,24 +414,21 @@ def parse_args():
         "--sample_size",
         type=int,
         nargs="+",
-        default=[512],
-        help="Resize/crop size used before VAE encode. Pass one value for square or two values for HEIGHT WIDTH.",
+        default=[480, 832],
+        help="Letterboxed sample size used before VAE encode. Pass one value for square or two values for HEIGHT WIDTH.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--fps", type=int, default=4, help="GIF playback FPS.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Inference weight dtype.")
     args = parser.parse_args()
 
-    if "{prompt}" not in args.prompt_template:
-        raise ValueError("--prompt_template must contain the '{prompt}' placeholder.")
-
     cache_mode = args.cached_sample_path is not None or args.cached_data_meta is not None
-    image_mode = args.image_path is not None or args.prompt is not None
+    image_mode = args.image_path is not None or args.mask_path is not None
     if cache_mode and image_mode:
         raise ValueError("Choose either direct image mode or cached mode, not both.")
     if not cache_mode:
-        if args.image_path is None or args.prompt is None:
-            raise ValueError("Image mode requires both --image_path and --prompt.")
+        if args.image_path is None or args.mask_path is None:
+            raise ValueError("Image mode requires both --image_path and --mask_path.")
     else:
         if args.cached_sample_path is not None and args.cached_data_meta is not None:
             raise ValueError("Choose either --cached_sample_path or --cached_data_meta, not both.")
@@ -503,6 +522,7 @@ def main():
         )
 
     os.makedirs(args.output_dir, exist_ok=True)
+    default_prompt_cache = _encode_fixed_prompt(tokenizer, text_encoder, device, weight_dtype)
 
     if args.cached_sample_path is not None or args.cached_data_meta is not None:
         result = _run_singleturn_cached_mode(
@@ -510,6 +530,7 @@ def main():
             args=args,
             weight_dtype=weight_dtype,
             generator=generator,
+            default_prompt_cache=default_prompt_cache,
         )
     else:
         result = _run_singleturn_image_mode(

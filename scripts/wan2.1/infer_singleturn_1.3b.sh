@@ -3,18 +3,18 @@ set -euo pipefail
 
 export MODEL_NAME=${MODEL_NAME:-models/Wan2.1-T2V-1.3B}
 export IMAGE_PATH=${IMAGE_PATH:-}
+export MASK_PATH=${MASK_PATH:-}
 export PROMPT=${PROMPT:-}
 export CACHED_SAMPLE_PATH=${CACHED_SAMPLE_PATH:-}
-export CACHED_DATA_META=${CACHED_DATA_META:-}
-export CACHED_DATA_DIR=${CACHED_DATA_DIR:-}
+export CACHED_DATA_META=${CACHED_DATA_META:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b/manifest.json}
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b}
 export SHARED_PROMPT_CACHE=${SHARED_PROMPT_CACHE:-}
 export CACHED_START_INDEX=${CACHED_START_INDEX:-0}
 export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-}
 export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/singleturn}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/singleturn_object_removal}
 export LORA_PATH=${LORA_PATH:-}
-export PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-Edit the source image according to this instruction: {prompt}}
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-50}
@@ -34,7 +34,7 @@ fi
 
 if [[ -z "${IMAGE_PATH}" ]]; then
   if [[ -z "${CACHED_SAMPLE_PATH}" && -z "${CACHED_DATA_META}" ]]; then
-    echo "Set either IMAGE_PATH/PROMPT or CACHED_SAMPLE_PATH/CACHED_DATA_META." >&2
+    echo "Set either IMAGE_PATH/MASK_PATH or CACHED_SAMPLE_PATH/CACHED_DATA_META." >&2
     exit 1
   fi
 fi
@@ -43,7 +43,6 @@ cmd_base=(
   scripts/wan2.1/singleturn_edit_infer.py
   --pretrained_model_name_or_path "$MODEL_NAME"
   --output_dir "$OUTPUT_DIR"
-  --prompt_template "$PROMPT_TEMPLATE"
   --num_inference_steps "$NUM_INFERENCE_STEPS"
   --guidance_scale "$GUIDANCE_SCALE"
   --sample_size "$SAMPLE_HEIGHT" "$SAMPLE_WIDTH"
@@ -70,8 +69,8 @@ else
 fi
 
 if [[ -n "${CACHED_SAMPLE_PATH}" || -n "${CACHED_DATA_META}" ]]; then
-  if [[ -n "${IMAGE_PATH}" || -n "${PROMPT}" ]]; then
-    echo "Cached mode does not accept IMAGE_PATH/PROMPT." >&2
+  if [[ -n "${IMAGE_PATH}" || -n "${MASK_PATH}" ]]; then
+    echo "Cached mode does not accept IMAGE_PATH/MASK_PATH." >&2
     exit 1
   fi
   if [[ -n "${CACHED_SAMPLE_PATH}" ]]; then
@@ -93,11 +92,14 @@ if [[ -n "${CACHED_SAMPLE_PATH}" || -n "${CACHED_DATA_META}" ]]; then
   cmd+=(--cached_num_workers "$CACHED_NUM_WORKERS")
   cmd+=(--cached_prefetch_factor "$CACHED_PREFETCH_FACTOR")
 else
-  if [[ -z "${PROMPT}" ]]; then
-    echo "PROMPT must be set." >&2
+  if [[ -z "${MASK_PATH}" ]]; then
+    echo "MASK_PATH must be set in image mode." >&2
     exit 1
   fi
-  cmd+=(--image_path "$IMAGE_PATH" --prompt "$PROMPT")
+  if [[ -n "${PROMPT}" ]]; then
+    echo "PROMPT is ignored in CORNE object-removal image mode." >&2
+  fi
+  cmd+=(--image_path "$IMAGE_PATH" --mask_path "$MASK_PATH")
 fi
 
 if [[ -n "${LORA_PATH}" ]]; then

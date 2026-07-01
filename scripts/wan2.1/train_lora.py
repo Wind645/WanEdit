@@ -81,7 +81,6 @@ from videox_fun.data.dataset_image_video import (ImageVideoDataset,
                                                 VideoEditReasoningDataset,
                                                 get_random_mask)
 from videox_fun.data.singleturn_dataset import (CachedSingleTurnLatentDataset,
-                                                CachedSingleTurnReconstructionDataset,
                                                 SingleTurnEditDataset)
 from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
                               WanTransformer3DModel)
@@ -97,15 +96,14 @@ except ImportError:
             )
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import create_network, merge_lora, unmerge_lora
-from videox_fun.utils.singleturn_utils import (DEFAULT_SINGLETURN_PROMPT_TEMPLATE,
-                                               build_singleturn_training_latents,
-                                               normalize_singleturn_sample_size,
+from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
+                                               build_singleturn_object_removal_latents,
                                                compute_wan_seq_len_from_latents,
-                                               format_singleturn_prompt,
                                                generate_singleturn_sample,
+                                               normalize_singleturn_sample_size,
                                                prepare_singleturn_noisy_latents,
-                                               preprocess_singleturn_image,
-                                               sample_latent_from_posterior_moments,
+                                               preprocess_singleturn_conditioning_image,
+                                               resize_singleturn_mask_to_latent_grid,
                                                save_singleturn_outputs)
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
 
@@ -188,26 +186,11 @@ def load_cached_batch(batch, weight_dtype, device):
 
 
 def load_cached_singleturn_batch(batch, weight_dtype, device):
-    source_latent_mean = batch["source_latent_mean"].to(device=device, dtype=weight_dtype, non_blocking=True)
-    source_latent_logvar = batch["source_latent_logvar"].to(device=device, dtype=weight_dtype, non_blocking=True)
-    target_latent_mean = batch["target_latent_mean"].to(device=device, dtype=weight_dtype, non_blocking=True)
-    target_latent_logvar = batch["target_latent_logvar"].to(device=device, dtype=weight_dtype, non_blocking=True)
+    full_latents = batch["full_latents"].to(device=device, dtype=weight_dtype, non_blocking=True)
     prompt_embeds_padded = batch["prompt_embeds"].to(device=device, dtype=weight_dtype, non_blocking=True)
     prompt_seq_lens = batch["prompt_seq_len"].tolist()
     prompt_embeds = [embed[:seq_len] for embed, seq_len in zip(prompt_embeds_padded, prompt_seq_lens)]
-    return (
-        source_latent_mean,
-        source_latent_logvar,
-        target_latent_mean,
-        target_latent_logvar,
-        prompt_embeds,
-    )
-
-
-def load_cached_singleturn_reconstruction_batch(batch, weight_dtype, device):
-    source_latent_mean = batch["source_latent_mean"].to(device=device, dtype=weight_dtype, non_blocking=True)
-    source_latent_logvar = batch["source_latent_logvar"].to(device=device, dtype=weight_dtype, non_blocking=True)
-    return source_latent_mean, source_latent_logvar
+    return full_latents, prompt_embeds
 
 
 def load_singleturn_shared_prompt_cache(prompt_cache_path, weight_dtype, device):
@@ -344,8 +327,8 @@ def log_singleturn_validation_to_wandb(args, global_step, source_image_path, for
 def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer3d, network, config, args, accelerator, weight_dtype, global_step):
     try:
         if getattr(args, "singleturn_mode", False):
-            if not args.singleturn_validation_image_path or args.singleturn_validation_prompt is None:
-                logger.info("Skipping SingleTurn validation because no validation image/prompt pair was provided.")
+            if not args.singleturn_validation_image_path or not args.singleturn_validation_mask_path:
+                logger.info("Skipping SingleTurn validation because no validation image/mask pair was provided.")
                 return
 
             logger.info("Running SingleTurn validation...")
@@ -384,8 +367,9 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                 validation_seed = args.singleturn_validation_seed if args.singleturn_validation_seed is not None else args.seed
                 generator = torch.Generator(device=accelerator.device).manual_seed(validation_seed)
 
-            source_tensor = preprocess_singleturn_image(
+            source_tensor = preprocess_singleturn_conditioning_image(
                 args.singleturn_validation_image_path,
+                args.singleturn_validation_mask_path,
                 resolve_singleturn_sample_size(args),
             ).to(device=accelerator.device, dtype=weight_dtype)
 
@@ -393,8 +377,6 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                 generation = generate_singleturn_sample(
                     pipeline=pipeline,
                     source_tensor=source_tensor,
-                    prompt=args.singleturn_validation_prompt,
-                    prompt_template=args.prompt_template,
                     negative_prompt=args.singleturn_validation_negative_prompt,
                     guidance_scale=args.singleturn_validation_guidance_scale,
                     num_inference_steps=args.singleturn_validation_num_inference_steps,
@@ -985,19 +967,37 @@ def parse_args():
     parser.add_argument(
         "--singleturn_reconstruction_mode",
         action="store_true",
-        help="In SingleTurn cached training, reconstruct source images by using source latents as both first and last frames.",
+        help="Deprecated and unsupported for CORNE object-removal mode.",
     )
     parser.add_argument(
         "--singleturn_reconstruction_prompt_cache",
         type=str,
         default=None,
-        help="Path to shared T5 prompt embedding cache used by --singleturn_reconstruction_mode.",
+        help="Deprecated and unsupported for CORNE object-removal mode.",
+    )
+    parser.add_argument(
+        "--singleturn_null_drop_prob",
+        type=float,
+        default=0.0,
+        help="Deprecated and unsupported for CORNE object-removal mode.",
+    )
+    parser.add_argument(
+        "--singleturn_sdedit_strength_min",
+        type=float,
+        default=None,
+        help="Deprecated and unsupported for CORNE object-removal mode.",
+    )
+    parser.add_argument(
+        "--singleturn_sdedit_strength_max",
+        type=float,
+        default=None,
+        help="Deprecated and unsupported for CORNE object-removal mode.",
     )
     parser.add_argument(
         "--prompt_template",
         type=str,
-        default=DEFAULT_SINGLETURN_PROMPT_TEMPLATE,
-        help="Prompt template used by SingleTurn train/infer. Must contain '{prompt}'.",
+        default=CORNE_SINGLETURN_PROMPT,
+        help="Deprecated and ignored. Prompt is fixed for CORNE object-removal mode.",
     )
     parser.add_argument(
         "--singleturn_sample_size",
@@ -1017,7 +1017,13 @@ def parse_args():
         "--singleturn_validation_prompt",
         type=str,
         default=None,
-        help="Optional validation edit prompt used for SingleTurn media logging.",
+        help="Deprecated and ignored. Prompt is fixed for CORNE object-removal mode.",
+    )
+    parser.add_argument(
+        "--singleturn_validation_mask_path",
+        type=str,
+        default=None,
+        help="Optional validation mask path used for SingleTurn media logging.",
     )
     parser.add_argument(
         "--singleturn_validation_negative_prompt",
@@ -1149,13 +1155,17 @@ def parse_args():
         args.non_ema_revision = args.revision
 
     if args.singleturn_mode:
-        if (not args.singleturn_reconstruction_mode) and "{prompt}" not in args.prompt_template:
-            raise ValueError("SingleTurn mode requires --prompt_template to contain the '{prompt}' placeholder.")
-        if args.singleturn_reconstruction_mode and args.cached_data_meta is None:
-            raise ValueError("--singleturn_reconstruction_mode requires cached SingleTurn data.")
-        if args.singleturn_reconstruction_mode and args.singleturn_reconstruction_prompt_cache is None:
+        if args.singleturn_reconstruction_mode:
+            raise ValueError("CORNE object-removal SingleTurn mode no longer supports --singleturn_reconstruction_mode.")
+        if args.singleturn_reconstruction_prompt_cache is not None:
             raise ValueError(
-                "--singleturn_reconstruction_mode requires --singleturn_reconstruction_prompt_cache."
+                "CORNE object-removal SingleTurn mode no longer supports --singleturn_reconstruction_prompt_cache."
+            )
+        if args.singleturn_null_drop_prob not in (0, 0.0):
+            raise ValueError("CORNE object-removal SingleTurn mode no longer supports --singleturn_null_drop_prob.")
+        if args.singleturn_sdedit_strength_min is not None or args.singleturn_sdedit_strength_max is not None:
+            raise ValueError(
+                "CORNE object-removal SingleTurn mode no longer supports --singleturn_sdedit_strength_min/max."
             )
         if args.singleturn_sample_size is not None:
             singleturn_sample_size = normalize_singleturn_sample_size(args.singleturn_sample_size)
@@ -1206,15 +1216,15 @@ def parse_args():
             raise ValueError("Cached training does not support runtime validation prompts.")
         if args.low_vram:
             raise ValueError("Cached training does not use runtime VAE/T5, so --low_vram is not applicable.")
-        if args.singleturn_reconstruction_mode and args.train_data_manifest is not None:
-            raise ValueError("--train_data_manifest is not used in reconstruction cached training.")
 
-    if (args.singleturn_validation_image_path is None) != (args.singleturn_validation_prompt is None):
+    if (args.singleturn_validation_image_path is None) != (args.singleturn_validation_mask_path is None):
         raise ValueError(
-            "Provide both --singleturn_validation_image_path and --singleturn_validation_prompt together for SingleTurn validation."
+            "Provide both --singleturn_validation_image_path and --singleturn_validation_mask_path together for SingleTurn validation."
         )
     if args.singleturn_validation_image_path is not None and not os.path.exists(args.singleturn_validation_image_path):
         raise ValueError(f"SingleTurn validation image does not exist: {args.singleturn_validation_image_path}")
+    if args.singleturn_validation_mask_path is not None and not os.path.exists(args.singleturn_validation_mask_path):
+        raise ValueError(f"SingleTurn validation mask does not exist: {args.singleturn_validation_mask_path}")
 
     return args
 
@@ -1356,17 +1366,6 @@ def main():
         args.mixed_precision = accelerator.mixed_precision
 
     singleturn_shared_prompt_cache = None
-    if args.singleturn_mode and args.singleturn_reconstruction_mode:
-        singleturn_shared_prompt_cache = load_singleturn_shared_prompt_cache(
-            args.singleturn_reconstruction_prompt_cache,
-            weight_dtype=weight_dtype,
-            device=accelerator.device,
-        )
-        if accelerator.is_local_main_process:
-            print(
-                "Loaded SingleTurn reconstruction shared prompt: "
-                f"{singleturn_shared_prompt_cache.get('formatted_text', '')}"
-            )
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = FlowMatchEulerDiscreteScheduler(
@@ -1634,10 +1633,7 @@ def main():
 
     if use_cached_data:
         if args.singleturn_mode:
-            if args.singleturn_reconstruction_mode:
-                train_dataset = CachedSingleTurnReconstructionDataset(args.cached_data_meta, args.cached_data_dir)
-            else:
-                train_dataset = CachedSingleTurnLatentDataset(args.cached_data_meta, args.cached_data_dir)
+            train_dataset = CachedSingleTurnLatentDataset(args.cached_data_meta, args.cached_data_dir)
         else:
             train_dataset = CachedVideoLatentDataset(args.cached_data_meta, args.cached_data_dir)
         train_dataloader = torch.utils.data.DataLoader(
@@ -2129,53 +2125,11 @@ def main():
                 if use_cached_data:
                     with torch.no_grad():
                         if args.singleturn_mode:
-                            if args.singleturn_reconstruction_mode:
-                                (
-                                    source_latent_mean,
-                                    source_latent_logvar,
-                                ) = load_cached_singleturn_reconstruction_batch(
-                                    batch=batch,
-                                    weight_dtype=weight_dtype,
-                                    device=accelerator.device,
-                                )
-                                if singleturn_shared_prompt_cache is None:
-                                    raise RuntimeError("SingleTurn reconstruction prompt cache was not loaded.")
-                                prompt_embed = singleturn_shared_prompt_cache["prompt_embeds"]
-                                prompt_embeds = [prompt_embed for _ in range(source_latent_mean.shape[0])]
-                            else:
-                                (
-                                    source_latent_mean,
-                                    source_latent_logvar,
-                                    target_latent_mean,
-                                    target_latent_logvar,
-                                    prompt_embeds,
-                                ) = load_cached_singleturn_batch(
-                                    batch=batch,
-                                    weight_dtype=weight_dtype,
-                                    device=accelerator.device,
-                                )
-                            source_latents = sample_latent_from_posterior_moments(
-                                source_latent_mean,
-                                source_latent_logvar,
-                                generator=torch_rng,
-                                dtype=weight_dtype,
+                            latents, prompt_embeds = load_cached_singleturn_batch(
+                                batch=batch,
+                                weight_dtype=weight_dtype,
+                                device=accelerator.device,
                             )
-                            if args.singleturn_reconstruction_mode:
-                                target_latents = source_latents
-                            else:
-                                target_latents = sample_latent_from_posterior_moments(
-                                    target_latent_mean,
-                                    target_latent_logvar,
-                                    generator=torch_rng,
-                                    dtype=weight_dtype,
-                                )
-                            anchor_noise = torch.randn(
-                                source_latents.size(),
-                                device=source_latents.device,
-                                generator=torch_rng,
-                                dtype=weight_dtype,
-                            )
-                            latents = build_singleturn_training_latents(source_latents, target_latents, anchor_noise)
                         else:
                             latents, prompt_embeds = load_cached_batch(
                                 batch=batch,
@@ -2188,10 +2142,8 @@ def main():
                     if args.singleturn_mode:
                         src_pixel_values = batch["pixel_values_src_image"].to(weight_dtype)
                         tgt_pixel_values = batch["pixel_values_tgt_image"].to(weight_dtype)
-                        batch_texts = [
-                            format_singleturn_prompt(text, args.prompt_template) if text else ""
-                            for text in batch["text"]
-                        ]
+                        mask_check_pixel_values = batch["pixel_values_mask_check"].to(weight_dtype)
+                        batch_texts = [CORNE_SINGLETURN_PROMPT] * src_pixel_values.shape[0]
                         inpaint_latents = None
                         clip_context = None
                     else:
@@ -2310,14 +2262,14 @@ def main():
                 if not use_cached_data:
                     with torch.no_grad():
                         # This way is quicker when batch grows up
-                        def _batch_encode_vae(pixel_values):
+                        def _batch_encode_vae(pixel_values, use_mode=False):
                             pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
                             bs = args.vae_mini_batch
                             new_pixel_values = []
                             for i in range(0, pixel_values.shape[0], bs):
                                 pixel_values_bs = pixel_values[i : i + bs]
                                 pixel_values_bs = vae.encode(pixel_values_bs)[0]
-                                pixel_values_bs = pixel_values_bs.sample()
+                                pixel_values_bs = pixel_values_bs.mode() if use_mode else pixel_values_bs.sample()
                                 new_pixel_values.append(pixel_values_bs)
                             return torch.cat(new_pixel_values, dim = 0)
 
@@ -2336,15 +2288,21 @@ def main():
                                 except Exception as _:
                                     pass
                         if args.singleturn_mode:
-                            source_latents = _batch_encode_vae(src_pixel_values)
-                            target_latents = _batch_encode_vae(tgt_pixel_values)
-                            anchor_noise = torch.randn(
+                            source_latents = _batch_encode_vae(src_pixel_values, use_mode=True)
+                            target_latents = _batch_encode_vae(tgt_pixel_values, use_mode=True)
+                            latent_mask = resize_singleturn_mask_to_latent_grid(mask_check_pixel_values, source_latents)
+                            noise_latents = torch.randn(
                                 source_latents.size(),
                                 device=source_latents.device,
                                 generator=torch_rng,
                                 dtype=weight_dtype,
                             )
-                            latents = build_singleturn_training_latents(source_latents, target_latents, anchor_noise)
+                            latents = build_singleturn_object_removal_latents(
+                                first_frame_latent=source_latents,
+                                bg_latent=target_latents,
+                                mask_check_latent=latent_mask,
+                                noise_latent=noise_latents,
+                            )
                         elif vae_stream_1 is not None:
                             vae_stream_1.wait_stream(torch.cuda.current_stream())
                             with torch.cuda.stream(vae_stream_1):

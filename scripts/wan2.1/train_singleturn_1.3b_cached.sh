@@ -2,31 +2,21 @@
 set -euo pipefail
 
 export MODEL_NAME=${MODEL_NAME:-models/Wan2.1-T2V-1.3B}
-if [[ -z "${CACHED_DATA_DIR:-}" ]]; then
-  if [[ -d /home/data/nas_hdd/instructpix2pix ]]; then
-    export CACHED_DATA_DIR=/home/data/nas_hdd/instructpix2pix/cache/singleturn_wan2.1_1.3b
-  else
-    export CACHED_DATA_DIR=cache/singleturn_wan2.1_1.3b
-  fi
-fi
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b}
 export CACHED_DATA_META=${CACHED_DATA_META:-${CACHED_DATA_DIR}/manifest.json}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-export OUTPUT_DIR=${OUTPUT_DIR:-/home/data/nas_hdd/instructpix2pix/ckpt}
+export OUTPUT_DIR=${OUTPUT_DIR:-/home/data/nas_hdd/CORNE_extracted/ckpt/singleturn_object_removal_wan2.1_1.3b}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
-export PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-Edit the source image according to this instruction: {prompt}}
-export SINGLETURN_GT_MODE=${SINGLETURN_GT_MODE:-edit}
-export SINGLETURN_NULL_PROMPT_CACHE=${SINGLETURN_NULL_PROMPT_CACHE:-${CACHED_DATA_DIR}/null_prompt_embeds.pt}
-export SINGLETURN_NULL_PROMPT=${SINGLETURN_NULL_PROMPT:-}
 export WANDB_MODE=${WANDB_MODE:-online}
 export REPORT_TO=${REPORT_TO:-wandb}
-export TRACKER_PROJECT_NAME=${TRACKER_PROJECT_NAME:-wan2.1-singleturn-lora-cached}
+export TRACKER_PROJECT_NAME=${TRACKER_PROJECT_NAME:-wan2.1-singleturn-object-removal-cached}
 export WANDB_ENTITY=${WANDB_ENTITY:-}
 export RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
 export SAVE_STATE=${SAVE_STATE:-0}
 export LORA_INIT_PATH=${LORA_INIT_PATH:-}
 export SINGLETURN_VALIDATION_IMAGE_PATH=${SINGLETURN_VALIDATION_IMAGE_PATH:-}
-export SINGLETURN_VALIDATION_PROMPT=${SINGLETURN_VALIDATION_PROMPT:-}
+export SINGLETURN_VALIDATION_MASK_PATH=${SINGLETURN_VALIDATION_MASK_PATH:-}
 export SINGLETURN_VALIDATION_NEGATIVE_PROMPT=${SINGLETURN_VALIDATION_NEGATIVE_PROMPT:-}
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
@@ -52,20 +42,6 @@ fi
 if [[ "${NPROC_PER_NODE}" -le 0 || "${TRAIN_BATCH_SIZE}" -le 0 || "${GRADIENT_ACCUMULATION_STEPS}" -le 0 ]]; then
   echo "NPROC_PER_NODE, TRAIN_BATCH_SIZE, and GRADIENT_ACCUMULATION_STEPS must all be positive." >&2
   exit 1
-fi
-
-if [[ "${SINGLETURN_GT_MODE}" != "edit" && "${SINGLETURN_GT_MODE}" != "reconstruction" ]]; then
-  echo "SINGLETURN_GT_MODE must be either 'edit' or 'reconstruction'." >&2
-  exit 1
-fi
-
-if [[ "${SINGLETURN_GT_MODE}" == "reconstruction" && ! -f "${SINGLETURN_NULL_PROMPT_CACHE}" ]]; then
-  echo "Null prompt cache does not exist, generating: ${SINGLETURN_NULL_PROMPT_CACHE}"
-  python scripts/wan2.1/precompute_singleturn_prompt_cache.py \
-    --pretrained_model_name_or_path "$MODEL_NAME" \
-    --output_path "$SINGLETURN_NULL_PROMPT_CACHE" \
-    --prompt "$SINGLETURN_NULL_PROMPT" \
-    --dtype bf16
 fi
 
 TOTAL_TRAIN_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * NPROC_PER_NODE))
@@ -112,7 +88,6 @@ cmd=(
   --cached_data_dir "$CACHED_DATA_DIR"
   --cached_data_meta "$CACHED_DATA_META"
   --singleturn_sample_size "$SAMPLE_HEIGHT" "$SAMPLE_WIDTH"
-  --prompt_template "$PROMPT_TEMPLATE"
   --report_to "$REPORT_TO"
   --tracker_project_name "$TRACKER_PROJECT_NAME"
   --tracker_entity "$WANDB_ENTITY"
@@ -134,13 +109,6 @@ cmd=(
   --use_deepspeed
 )
 
-if [[ "${SINGLETURN_GT_MODE}" == "reconstruction" ]]; then
-  cmd+=(
-    --singleturn_reconstruction_mode
-    --singleturn_reconstruction_prompt_cache "$SINGLETURN_NULL_PROMPT_CACHE"
-  )
-fi
-
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   cmd+=(
     --resume_from_checkpoint "$RESUME_FROM_CHECKPOINT"
@@ -159,10 +127,10 @@ if [[ "${SAVE_STATE}" == "1" ]]; then
   )
 fi
 
-if [[ -n "${SINGLETURN_VALIDATION_IMAGE_PATH}" || -n "${SINGLETURN_VALIDATION_PROMPT}" ]]; then
+if [[ -n "${SINGLETURN_VALIDATION_IMAGE_PATH}" || -n "${SINGLETURN_VALIDATION_MASK_PATH}" ]]; then
   cmd+=(
     --singleturn_validation_image_path "$SINGLETURN_VALIDATION_IMAGE_PATH"
-    --singleturn_validation_prompt "$SINGLETURN_VALIDATION_PROMPT"
+    --singleturn_validation_mask_path "$SINGLETURN_VALIDATION_MASK_PATH"
     --singleturn_validation_negative_prompt "$SINGLETURN_VALIDATION_NEGATIVE_PROMPT"
     --singleturn_validation_guidance_scale "$SINGLETURN_VALIDATION_GUIDANCE_SCALE"
     --singleturn_validation_num_inference_steps "$SINGLETURN_VALIDATION_NUM_INFERENCE_STEPS"
