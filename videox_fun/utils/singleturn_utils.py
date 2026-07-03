@@ -15,7 +15,7 @@ SINGLETURN_TOTAL_FRAMES = 7
 SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 1
 SINGLETURN_TAIL_START = 1
 SINGLETURN_MASK_GRAY_VALUE = 0.5
-SINGLETURN_MASK_ALPHA = 0.5
+SINGLETURN_MASK_ALPHA = 0.7
 
 
 def format_singleturn_prompt(prompt: Optional[str] = None, prompt_template: Optional[str] = None) -> str:
@@ -145,9 +145,9 @@ def apply_singleturn_gray_mask_overlay(image_tensor: torch.Tensor, mask_tensor: 
             f"image_tensor and mask_tensor must share spatial size, got {tuple(image_tensor.shape)} and {tuple(mask_tensor.shape)}"
         )
 
-    alpha_mask = mask_tensor.clamp(0, 1) * SINGLETURN_MASK_ALPHA
+    binary_mask = mask_tensor.clamp(0, 1)
     gray = torch.full_like(image_tensor, SINGLETURN_MASK_GRAY_VALUE)
-    return image_tensor * (1.0 - alpha_mask) + gray * alpha_mask
+    return image_tensor * (1.0 - binary_mask * SINGLETURN_MASK_ALPHA) + gray * (binary_mask * SINGLETURN_MASK_ALPHA)
 
 
 def preprocess_singleturn_conditioning_image(

@@ -10,6 +10,7 @@ from typing import Optional
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from omegaconf import OmegaConf
+from PIL import Image
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -34,6 +35,8 @@ from videox_fun.utils.singleturn_utils import (
     generate_singleturn_sample_from_latents,
     normalize_singleturn_sample_size,
     preprocess_singleturn_conditioning_image,
+    preprocess_singleturn_image,
+    preprocess_singleturn_mask,
     save_singleturn_outputs,
 )
 from videox_fun.utils.utils import filter_kwargs
@@ -159,6 +162,53 @@ def _save_singleturn_result(
     return output_paths, metadata_path
 
 
+def _tensor_image_to_pil(tensor: torch.Tensor) -> Image.Image:
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected tensor with shape (C, H, W), got {tuple(tensor.shape)}")
+    tensor = tensor.detach().cpu().float()
+    if tensor.shape[0] == 1:
+        tensor = tensor.repeat(3, 1, 1)
+    tensor = ((tensor.clamp(-1, 1) + 1.0) / 2.0).clamp(0, 1)
+    array = (tensor.permute(1, 2, 0).numpy() * 255).astype("uint8")
+    return Image.fromarray(array)
+
+
+def _tensor_mask_to_pil(tensor: torch.Tensor) -> Image.Image:
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected mask tensor with shape (1, H, W), got {tuple(tensor.shape)}")
+    tensor = tensor.detach().cpu().float().clamp(0, 1)
+    array = (tensor[0].numpy() * 255).astype("uint8")
+    return Image.fromarray(array, mode="L")
+
+
+def _save_singleturn_conditioning_visuals(
+    *,
+    output_dir: str,
+    stem: str,
+    source_path: str,
+    mask_path: str,
+    sample_size: tuple[int, int],
+) -> dict:
+    os.makedirs(output_dir, exist_ok=True)
+    source_tensor = preprocess_singleturn_image(source_path, sample_size)[0, 0]
+    mask_tensor = preprocess_singleturn_mask(mask_path, sample_size)[0, 0]
+    conditioning_tensor = preprocess_singleturn_conditioning_image(source_path, mask_path, sample_size)[0, 0]
+
+    source_output_path = os.path.join(output_dir, f"{stem}_source.png")
+    mask_output_path = os.path.join(output_dir, f"{stem}_mask.png")
+    conditioning_output_path = os.path.join(output_dir, f"{stem}_conditioning.png")
+
+    _tensor_image_to_pil(source_tensor).save(source_output_path)
+    _tensor_mask_to_pil(mask_tensor).save(mask_output_path)
+    _tensor_image_to_pil(conditioning_tensor).save(conditioning_output_path)
+
+    return {
+        "source_preview": source_output_path,
+        "mask_preview": mask_output_path,
+        "conditioning_preview": conditioning_output_path,
+    }
+
+
 def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
     source_tensor = preprocess_singleturn_conditioning_image(args.image_path, args.mask_path, args.sample_size).to(
         device=pipeline._execution_device,
@@ -177,6 +227,13 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
         )
 
     output_name = args.output_name or Path(args.image_path).stem
+    preview_paths = _save_singleturn_conditioning_visuals(
+        output_dir=args.output_dir,
+        stem=output_name,
+        source_path=args.image_path,
+        mask_path=args.mask_path,
+        sample_size=args.sample_size,
+    )
     output_paths, metadata_path = _save_singleturn_result(
         output_dir=args.output_dir,
         stem=output_name,
@@ -191,6 +248,7 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "sample_size": list(args.sample_size),
+            "input_previews": preview_paths,
         },
         fps=args.fps,
     )
@@ -209,6 +267,10 @@ def _run_singleturn_cached_sample(
     output_dir: str,
     stem: str,
 ):
+    conditioning_mask_path = sample.get("mask_sam_image", "") if sample.get("used_mask_sam", False) else ""
+    if not conditioning_mask_path:
+        conditioning_mask_path = sample.get("mask_check_image", "")
+
     with torch.no_grad():
         generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
@@ -220,6 +282,16 @@ def _run_singleturn_cached_sample(
             num_inference_steps=args.num_inference_steps,
             generator=generator,
             weight_dtype=weight_dtype,
+        )
+
+    preview_paths = {}
+    if sample.get("source_image") and conditioning_mask_path:
+        preview_paths = _save_singleturn_conditioning_visuals(
+            output_dir=output_dir,
+            stem=stem,
+            source_path=sample["source_image"],
+            mask_path=conditioning_mask_path,
+            sample_size=args.sample_size,
         )
 
     output_paths, metadata_path = _save_singleturn_result(
@@ -239,6 +311,8 @@ def _run_singleturn_cached_sample(
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
+            "conditioning_mask_image": conditioning_mask_path,
+            "input_previews": preview_paths,
         },
         fps=args.fps,
     )
