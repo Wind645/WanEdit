@@ -2,15 +2,15 @@
 set -euo pipefail
 
 export MODEL_NAME=${MODEL_NAME:-models/Wan2.1-T2V-1.3B}
-export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v2}
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix}
 export CACHED_DATA_META=${CACHED_DATA_META:-${CACHED_DATA_DIR}/manifest.json}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-export OUTPUT_DIR=${OUTPUT_DIR:-/home/data/nas_hdd/CORNE_extracted/ckpt/singleturn_object_removal_wan2.1_1.3b_v2}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-6}
+export OUTPUT_DIR=${OUTPUT_DIR:-/home/data/nas_hdd/CORNE_extracted/ckpt/final_SFT}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export WANDB_MODE=${WANDB_MODE:-online}
 export REPORT_TO=${REPORT_TO:-wandb}
-export TRACKER_PROJECT_NAME=${TRACKER_PROJECT_NAME:-wan2.1-singleturn-object-removal-cached}
+export TRACKER_PROJECT_NAME=${TRACKER_PROJECT_NAME:-wan2.1-singleturn-object-removal-cached-v3-twoprefix}
 export WANDB_ENTITY=${WANDB_ENTITY:-}
 export RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
 export SAVE_STATE=${SAVE_STATE:-0}

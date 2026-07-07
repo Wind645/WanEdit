@@ -3,7 +3,7 @@ set -euo pipefail
 
 export MODEL_NAME=${MODEL_NAME:-models/Wan2.1-T2V-1.3B}
 export SINGLETURN_DATA_DIR=${SINGLETURN_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted}
-export OUTPUT_DIR=${OUTPUT_DIR:-${SINGLETURN_DATA_DIR}/cache/singleturn_object_removal_wan2.1_1.3b}
+export OUTPUT_DIR=${OUTPUT_DIR:-${SINGLETURN_DATA_DIR}/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix}
 
 SAMPLE_HEIGHT=${SAMPLE_HEIGHT:-480}
 SAMPLE_WIDTH=${SAMPLE_WIDTH:-832}

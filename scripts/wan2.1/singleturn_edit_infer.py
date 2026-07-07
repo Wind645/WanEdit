@@ -34,8 +34,8 @@ from videox_fun.utils.singleturn_utils import (
     generate_singleturn_sample,
     generate_singleturn_sample_from_latents,
     normalize_singleturn_sample_size,
-    preprocess_singleturn_conditioning_image,
     preprocess_singleturn_image,
+    preprocess_singleturn_mask_frame,
     preprocess_singleturn_mask,
     save_singleturn_outputs,
 )
@@ -181,7 +181,7 @@ def _tensor_mask_to_pil(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="L")
 
 
-def _save_singleturn_conditioning_visuals(
+def _save_singleturn_input_visuals(
     *,
     output_dir: str,
     stem: str,
@@ -192,25 +192,32 @@ def _save_singleturn_conditioning_visuals(
     os.makedirs(output_dir, exist_ok=True)
     source_tensor = preprocess_singleturn_image(source_path, sample_size)[0, 0]
     mask_tensor = preprocess_singleturn_mask(mask_path, sample_size)[0, 0]
-    conditioning_tensor = preprocess_singleturn_conditioning_image(source_path, mask_path, sample_size)[0, 0]
+    mask_frame_tensor = preprocess_singleturn_mask_frame(mask_path, sample_size)[0, 0]
 
     source_output_path = os.path.join(output_dir, f"{stem}_source.png")
     mask_output_path = os.path.join(output_dir, f"{stem}_mask.png")
-    conditioning_output_path = os.path.join(output_dir, f"{stem}_conditioning.png")
+    mask_frame_output_path = os.path.join(output_dir, f"{stem}_mask_frame_input.png")
+    source_frame_output_path = os.path.join(output_dir, f"{stem}_source_frame_input.png")
 
     _tensor_image_to_pil(source_tensor).save(source_output_path)
     _tensor_mask_to_pil(mask_tensor).save(mask_output_path)
-    _tensor_image_to_pil(conditioning_tensor).save(conditioning_output_path)
+    _tensor_image_to_pil(mask_frame_tensor).save(mask_frame_output_path)
+    _tensor_image_to_pil(source_tensor).save(source_frame_output_path)
 
     return {
         "source_preview": source_output_path,
         "mask_preview": mask_output_path,
-        "conditioning_preview": conditioning_output_path,
+        "mask_frame_input_preview": mask_frame_output_path,
+        "source_frame_input_preview": source_frame_output_path,
     }
 
 
 def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
-    source_tensor = preprocess_singleturn_conditioning_image(args.image_path, args.mask_path, args.sample_size).to(
+    source_tensor = preprocess_singleturn_image(args.image_path, args.sample_size).to(
+        device=pipeline._execution_device,
+        dtype=weight_dtype,
+    )
+    mask_frame_tensor = preprocess_singleturn_mask_frame(args.mask_path, args.sample_size).to(
         device=pipeline._execution_device,
         dtype=weight_dtype,
     )
@@ -218,6 +225,7 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
     with torch.no_grad():
         generation = generate_singleturn_sample(
             pipeline=pipeline,
+            mask_frame_tensor=mask_frame_tensor,
             source_tensor=source_tensor,
             negative_prompt=args.negative_prompt,
             guidance_scale=args.guidance_scale,
@@ -227,7 +235,7 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
         )
 
     output_name = args.output_name or Path(args.image_path).stem
-    preview_paths = _save_singleturn_conditioning_visuals(
+    preview_paths = _save_singleturn_input_visuals(
         output_dir=args.output_dir,
         stem=output_name,
         source_path=args.image_path,
@@ -267,14 +275,15 @@ def _run_singleturn_cached_sample(
     output_dir: str,
     stem: str,
 ):
-    conditioning_mask_path = sample.get("mask_sam_image", "") if sample.get("used_mask_sam", False) else ""
-    if not conditioning_mask_path:
-        conditioning_mask_path = sample.get("mask_check_image", "")
+    mask_frame_path = sample.get("mask_sam_image", "") if sample.get("used_mask_sam", False) else ""
+    if not mask_frame_path:
+        mask_frame_path = sample.get("mask_check_image", "")
 
     with torch.no_grad():
         generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
-            source_latent=sample["first_frame_latent"],
+            mask_frame_latent=sample["mask_frame_latent"],
+            source_frame_latent=sample["source_frame_latent"],
             prompt_embeds=prompt_cache["prompt_embeds"],
             prompt_seq_len=prompt_cache["prompt_seq_len"],
             negative_prompt=args.negative_prompt,
@@ -285,12 +294,12 @@ def _run_singleturn_cached_sample(
         )
 
     preview_paths = {}
-    if sample.get("source_image") and conditioning_mask_path:
-        preview_paths = _save_singleturn_conditioning_visuals(
+    if sample.get("source_image") and mask_frame_path:
+        preview_paths = _save_singleturn_input_visuals(
             output_dir=output_dir,
             stem=stem,
             source_path=sample["source_image"],
-            mask_path=conditioning_mask_path,
+            mask_path=mask_frame_path,
             sample_size=args.sample_size,
         )
 
@@ -311,7 +320,7 @@ def _run_singleturn_cached_sample(
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
-            "conditioning_mask_image": conditioning_mask_path,
+            "mask_frame_image": mask_frame_path,
             "input_previews": preview_paths,
         },
         fps=args.fps,
@@ -346,19 +355,27 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 f"Cached SingleTurn sample {cache_path} uses the deprecated instructpix2pix posterior payload. "
                 "Re-run CORNE object-removal preprocess."
             )
-        if "first_frame_latent" not in payload:
-            raise ValueError(f"Cached SingleTurn sample {cache_path} is missing first_frame_latent.")
+        if payload.get("mode") != "singleturn_object_removal_v2":
+            raise ValueError(
+                f"Cached SingleTurn sample {cache_path} has unsupported mode={payload.get('mode')!r}. "
+                "Re-run CORNE object-removal preprocess for the 8-frame two-prefix cache."
+            )
+        missing = [key for key in ("mask_frame_latent", "source_frame_latent") if key not in payload]
+        if missing:
+            raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}.")
 
         prompt_cache = shared_prompt_cache
         if args.shared_prompt_cache is None and payload.get("shared_prompt_cache") is not None:
             prompt_cache = _load_shared_prompt_cache(_resolve_cache_path(payload["shared_prompt_cache"], cached_data_dir))
 
         sample = {
-            "first_frame_latent": payload["first_frame_latent"],
+            "mask_frame_latent": payload["mask_frame_latent"],
+            "source_frame_latent": payload["source_frame_latent"],
             "cache_path": cache_path,
             "source_image": payload.get("source_image", ""),
             "bg_image": payload.get("bg_image", ""),
             "mask_check_image": payload.get("mask_check_image", ""),
+            "mask_frame_image": payload.get("mask_frame_image", ""),
             "mask_sam_image": payload.get("mask_sam_image", ""),
             "used_mask_sam": bool(payload.get("used_mask_sam", False)),
             "idx": 0,
@@ -430,11 +447,13 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 }
 
             sample = {
-                "first_frame_latent": batch["first_frame_latent"],
+                "mask_frame_latent": batch["mask_frame_latent"],
+                "source_frame_latent": batch["source_frame_latent"],
                 "cache_path": cache_path,
                 "source_image": _first_item(batch["source_image"]),
                 "bg_image": _first_item(batch["bg_image"]),
                 "mask_check_image": _first_item(batch["mask_check_image"]),
+                "mask_frame_image": _first_item(batch["mask_frame_image"]),
                 "mask_sam_image": _first_item(batch["mask_sam_image"]),
                 "used_mask_sam": bool(_first_item(batch["used_mask_sam"])),
                 "idx": batch_index,

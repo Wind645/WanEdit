@@ -25,6 +25,9 @@ from videox_fun.data.singleturn_dataset import SingleTurnPreprocessIterableDatas
 from videox_fun.models import AutoencoderKLWan, WanT5EncoderModel
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
+    SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
+    SINGLETURN_TOTAL_FRAMES,
+    build_singleturn_edge_weight_map,
     build_singleturn_object_removal_latents,
     normalize_singleturn_sample_size,
     resize_singleturn_mask_to_latent_grid,
@@ -48,7 +51,7 @@ def resolve_model_path(model_root, subpath, default_subpath):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Precompute CORNE SingleTurn object-removal cache.")
+    parser = argparse.ArgumentParser(description="Precompute CORNE SingleTurn 8-frame two-prefix object-removal cache.")
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True, help="Base Wan model path.")
     parser.add_argument("--train_data_dir", type=str, required=True, help="CORNE_extracted root containing shot/, bg/, mask-check/, and optional mask_sam/.")
     parser.add_argument("--train_data_manifest", type=str, default=None, help="Deprecated and unsupported for CORNE object-removal mode.")
@@ -61,8 +64,10 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0, help="Must be 0 for quota-preserving sequential traversal.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Cache tensor dtype.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing cache files.")
-    parser.add_argument("--max_samples_with_mask_sam", type=int, default=30000, help="Quota for samples whose conditioning mask comes from mask_sam.")
-    parser.add_argument("--max_samples_without_mask_sam", type=int, default=30000, help="Quota for samples whose conditioning mask falls back to mask-check.")
+    parser.add_argument("--max_samples_with_mask_sam", type=int, default=30000, help="Quota for samples whose mask-latent first frame comes from mask_sam.")
+    parser.add_argument("--max_samples_without_mask_sam", type=int, default=30000, help="Quota for samples whose mask-latent first frame falls back to mask-check.")
+    parser.add_argument("--skip_samples_with_mask_sam", type=int, default=0, help="Skip this many with_mask_sam samples before collecting the shard.")
+    parser.add_argument("--skip_samples_without_mask_sam", type=int, default=0, help="Skip this many without_mask_sam samples before collecting the shard.")
     args = parser.parse_args()
 
     if args.train_data_manifest is not None:
@@ -71,8 +76,13 @@ def parse_args():
         raise ValueError("CORNE object-removal preprocess requires --num_workers 0 to preserve class quotas exactly.")
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive.")
-    if args.max_samples_with_mask_sam < 0 or args.max_samples_without_mask_sam < 0:
-        raise ValueError("Quota arguments must be non-negative.")
+    if (
+        args.max_samples_with_mask_sam < 0
+        or args.max_samples_without_mask_sam < 0
+        or args.skip_samples_with_mask_sam < 0
+        or args.skip_samples_without_mask_sam < 0
+    ):
+        raise ValueError("Quota and skip arguments must be non-negative.")
 
     sample_size = normalize_singleturn_sample_size(
         args.singleturn_sample_size if args.singleturn_sample_size is not None else args.video_sample_size
@@ -100,9 +110,11 @@ def build_cache_name(global_index: int, source_image: str) -> str:
 def build_manifest_entry(cache_path: Path, output_dir: Path, sample: dict) -> dict:
     entry = {
         "cache_path": str(cache_path.relative_to(output_dir)),
+        "mode": "singleturn_object_removal_v2",
         "source_image": sample["source_image"],
         "bg_image": sample["bg_image"],
         "mask_check_image": sample["mask_check_image"],
+        "mask_frame_image": sample["mask_frame_image"],
         "used_mask_sam": bool(sample["used_mask_sam"]),
         "global_index": int(sample["global_index"]),
     }
@@ -137,6 +149,11 @@ def _flush_batch(
         dtype=weight_dtype,
         non_blocking=True,
     )
+    mask_frame_batch = _stack_batch_tensors(batch_records, "pixel_values_mask_frame").to(
+        device=device,
+        dtype=weight_dtype,
+        non_blocking=True,
+    )
     bg_batch = _stack_batch_tensors(batch_records, "pixel_values_tgt_image").to(
         device=device,
         dtype=weight_dtype,
@@ -149,12 +166,15 @@ def _flush_batch(
     )
 
     with torch.no_grad():
-        first_frame_latents = vae.encode(source_batch.permute(0, 2, 1, 3, 4))[0].mode()
+        mask_frame_latents = vae.encode(mask_frame_batch.permute(0, 2, 1, 3, 4))[0].mode()
+        source_frame_latents = vae.encode(source_batch.permute(0, 2, 1, 3, 4))[0].mode()
         bg_latents = vae.encode(bg_batch.permute(0, 2, 1, 3, 4))[0].mode()
-        latent_mask = resize_singleturn_mask_to_latent_grid(mask_check_batch, first_frame_latents)
-        noise_latents = torch.randn_like(first_frame_latents)
+        latent_mask = resize_singleturn_mask_to_latent_grid(mask_check_batch, source_frame_latents)
+        noise_latents = torch.randn_like(source_frame_latents)
+        edge_weight_map = build_singleturn_edge_weight_map(latent_mask)
         full_latents = build_singleturn_object_removal_latents(
-            first_frame_latent=first_frame_latents,
+            mask_frame_latent=mask_frame_latents,
+            source_frame_latent=source_frame_latents,
             bg_latent=bg_latents,
             mask_check_latent=latent_mask,
             noise_latent=noise_latents,
@@ -166,13 +186,16 @@ def _flush_batch(
             raise FileExistsError(f"Cache file already exists: {cache_path}. Use --overwrite to replace it.")
 
         payload = {
-            "mode": "singleturn_object_removal",
+            "mode": "singleturn_object_removal_v2",
             "dataset_type": "corne_object_removal",
             "full_latents": full_latents[local_offset].detach().cpu().to(weight_dtype),
-            "first_frame_latent": first_frame_latents[local_offset].detach().cpu().to(weight_dtype),
+            "mask_frame_latent": mask_frame_latents[local_offset].detach().cpu().to(weight_dtype),
+            "source_frame_latent": source_frame_latents[local_offset].detach().cpu().to(weight_dtype),
+            "edge_weight_map": edge_weight_map[local_offset].detach().cpu().to(weight_dtype),
             "source_image": record["source_image"],
             "bg_image": record["bg_image"],
             "mask_check_image": record["mask_check_image"],
+            "mask_frame_image": record["mask_frame_image"],
             "used_mask_sam": bool(record["used_mask_sam"]),
             "singleturn_sample_size": list(singleturn_sample_size),
             "shared_prompt_cache": str(shared_prompt_path.relative_to(output_dir)),
@@ -253,6 +276,7 @@ def main():
             "formatted_text": CORNE_SINGLETURN_PROMPT,
             "mode": "singleturn_object_removal_prompt_cache",
             "tokenizer_max_length": args.tokenizer_max_length,
+            "conditioning_format": "mask-latent + clean-source-latent",
         },
         shared_prompt_path,
     )
@@ -262,6 +286,8 @@ def main():
         sample_size=args.singleturn_sample_size,
         max_samples_with_mask_sam=args.max_samples_with_mask_sam,
         max_samples_without_mask_sam=args.max_samples_without_mask_sam,
+        skip_samples_with_mask_sam=args.skip_samples_with_mask_sam,
+        skip_samples_without_mask_sam=args.skip_samples_without_mask_sam,
     )
 
     manifest: list[dict] = []
@@ -315,9 +341,16 @@ def main():
         json.dump(manifest, f, indent=2)
 
     metadata = {
+        "mode": "singleturn_object_removal_v2",
         "dataset_type": "corne_object_removal",
+        "conditioning_format": "8-frame 2-prefix mask-latent + clean-source-latent",
+        "prefix_frames": SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
+        "total_frames": SINGLETURN_TOTAL_FRAMES,
+        "pixel_space_source_masking": False,
         "max_samples_with_mask_sam": args.max_samples_with_mask_sam,
         "max_samples_without_mask_sam": args.max_samples_without_mask_sam,
+        "skip_samples_with_mask_sam": args.skip_samples_with_mask_sam,
+        "skip_samples_without_mask_sam": args.skip_samples_without_mask_sam,
         "num_samples_with_mask_sam": preprocess_dataset.num_samples_with_mask_sam,
         "num_samples_without_mask_sam": preprocess_dataset.num_samples_without_mask_sam,
         "stopped_early_when_quotas_met": bool(preprocess_dataset.stopped_early_when_quotas_met),
@@ -339,6 +372,8 @@ def main():
                 "num_samples_total": generated_samples,
                 "num_samples_with_mask_sam": preprocess_dataset.num_samples_with_mask_sam,
                 "num_samples_without_mask_sam": preprocess_dataset.num_samples_without_mask_sam,
+                "skip_samples_with_mask_sam": args.skip_samples_with_mask_sam,
+                "skip_samples_without_mask_sam": args.skip_samples_without_mask_sam,
             },
             indent=2,
         )

@@ -6,14 +6,14 @@ export IMAGE_PATH=${IMAGE_PATH:-}
 export MASK_PATH=${MASK_PATH:-}
 export PROMPT=${PROMPT:-}
 export CACHED_SAMPLE_PATH=${CACHED_SAMPLE_PATH:-}
-export CACHED_DATA_META=${CACHED_DATA_META:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v2/manifest.json}
-export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v2}
+export CACHED_DATA_META=${CACHED_DATA_META:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix/manifest.json}
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix}
 export SHARED_PROMPT_CACHE=${SHARED_PROMPT_CACHE:-}
 export CACHED_START_INDEX=${CACHED_START_INDEX:-0}
 export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-}
 export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/singleturn_object_removal_v2}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/singleturn_object_removal_v3_twoprefix}
 export LORA_PATH=${LORA_PATH:-}
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}

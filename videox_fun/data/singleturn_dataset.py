@@ -11,9 +11,10 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
     normalize_singleturn_sample_size,
-    preprocess_singleturn_conditioning_image,
     preprocess_singleturn_image,
+    preprocess_singleturn_mask_frame,
     preprocess_singleturn_mask,
+    SINGLETURN_TOTAL_FRAMES,
 )
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -134,7 +135,7 @@ def _build_corne_record(
         "mask_check_image": str(mask_check_path),
         "mask_sam_image": str(mask_sam_path) if mask_sam_path is not None else None,
         "used_mask_sam": used_mask_sam,
-        "conditioning_mask_image": str(mask_sam_path if used_mask_sam else mask_check_path),
+        "mask_frame_image": str(mask_sam_path if used_mask_sam else mask_check_path),
         "type": "image",
         "file_path": str(shot_path),
     }
@@ -183,11 +184,15 @@ class SingleTurnEditDataset(Dataset):
 
     def __getitem__(self, idx: int):
         record = self.dataset[idx % self.length]
-        conditioning_mask = record["conditioning_mask_image"]
         return {
-            "pixel_values_src_image": preprocess_singleturn_conditioning_image(
+            "pixel_values_src_image": preprocess_singleturn_image(
                 record["source_image"],
-                conditioning_mask,
+                self.video_sample_size,
+                add_batch_dim=False,
+                add_frame_dim=True,
+            ),
+            "pixel_values_mask_frame": preprocess_singleturn_mask_frame(
+                record["mask_frame_image"],
                 self.video_sample_size,
                 add_batch_dim=False,
                 add_frame_dim=True,
@@ -208,6 +213,7 @@ class SingleTurnEditDataset(Dataset):
             "source_image": record["source_image"],
             "bg_image": record["bg_image"],
             "mask_check_image": record["mask_check_image"],
+            "mask_frame_image": record["mask_frame_image"],
             "mask_sam_image": record["mask_sam_image"] or "",
             "used_mask_sam": bool(record["used_mask_sam"]),
             "data_type": "image",
@@ -225,6 +231,8 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
         reconstruction_only: bool = False,
         max_samples_with_mask_sam: int = 30000,
         max_samples_without_mask_sam: int = 30000,
+        skip_samples_with_mask_sam: int = 0,
+        skip_samples_without_mask_sam: int = 0,
     ):
         del manifest_path
         del parquet_batch_size
@@ -233,6 +241,8 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
         self.sample_size = normalize_singleturn_sample_size(sample_size)
         self.max_samples_with_mask_sam = int(max_samples_with_mask_sam)
         self.max_samples_without_mask_sam = int(max_samples_without_mask_sam)
+        self.skip_samples_with_mask_sam = int(skip_samples_with_mask_sam)
+        self.skip_samples_without_mask_sam = int(skip_samples_without_mask_sam)
         self.use_parquet = False
         self.records = None
         self.total_length = None
@@ -248,10 +258,14 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
                 "SingleTurn CORNE preprocess requires sequential iteration to preserve per-class quotas. "
                 "Run preprocess with --num_workers 0."
             )
+        if self.skip_samples_with_mask_sam < 0 or self.skip_samples_without_mask_sam < 0:
+            raise ValueError("SingleTurn skip quotas must be non-negative.")
 
         self.num_samples_with_mask_sam = 0
         self.num_samples_without_mask_sam = 0
         self.stopped_early_when_quotas_met = False
+        remaining_skip_with_mask_sam = self.skip_samples_with_mask_sam
+        remaining_skip_without_mask_sam = self.skip_samples_without_mask_sam
 
         for global_index, shot_path in enumerate(_iter_image_files(self._shot_dir)):
             if (
@@ -267,19 +281,29 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
 
             used_mask_sam = bool(record["used_mask_sam"])
             if used_mask_sam:
+                if remaining_skip_with_mask_sam > 0:
+                    remaining_skip_with_mask_sam -= 1
+                    continue
                 if self.num_samples_with_mask_sam >= self.max_samples_with_mask_sam:
                     continue
                 self.num_samples_with_mask_sam += 1
             else:
+                if remaining_skip_without_mask_sam > 0:
+                    remaining_skip_without_mask_sam -= 1
+                    continue
                 if self.num_samples_without_mask_sam >= self.max_samples_without_mask_sam:
                     continue
                 self.num_samples_without_mask_sam += 1
 
-            conditioning_mask = record["conditioning_mask_image"]
             yield {
-                "pixel_values_src_image": preprocess_singleturn_conditioning_image(
+                "pixel_values_src_image": preprocess_singleturn_image(
                     record["source_image"],
-                    conditioning_mask,
+                    self.sample_size,
+                    add_batch_dim=False,
+                    add_frame_dim=True,
+                ),
+                "pixel_values_mask_frame": preprocess_singleturn_mask_frame(
+                    record["mask_frame_image"],
                     self.sample_size,
                     add_batch_dim=False,
                     add_frame_dim=True,
@@ -300,6 +324,7 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
                 "source_image": record["source_image"],
                 "bg_image": record["bg_image"],
                 "mask_check_image": record["mask_check_image"],
+                "mask_frame_image": record["mask_frame_image"],
                 "mask_sam_image": record["mask_sam_image"] or "",
                 "used_mask_sam": used_mask_sam,
                 "global_index": global_index,
@@ -349,9 +374,25 @@ class CachedSingleTurnLatentDataset(Dataset):
                 "Re-run preprocess_singleturn_cache.py to generate CORNE object-removal caches."
             )
 
-        missing = [key for key in ("full_latents", "first_frame_latent") if key not in payload]
+        expected_mode = payload.get("mode")
+        if expected_mode != "singleturn_object_removal_v2":
+            raise ValueError(
+                f"Cached SingleTurn sample {cache_path} has unsupported mode={expected_mode!r}. "
+                "Re-run preprocess_singleturn_cache.py to generate 8-frame two-prefix CORNE caches."
+            )
+
+        missing = [
+            key
+            for key in ("full_latents", "mask_frame_latent", "source_frame_latent", "edge_weight_map")
+            if key not in payload
+        ]
         if missing:
             raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}")
+        if payload["full_latents"].shape[-3] != SINGLETURN_TOTAL_FRAMES:
+            raise ValueError(
+                f"Cached SingleTurn sample {cache_path} has {payload['full_latents'].shape[-3]} frames; "
+                f"expected {SINGLETURN_TOTAL_FRAMES}."
+            )
 
         prompt_embeds = payload.get("prompt_embeds")
         prompt_seq_len = payload.get("prompt_seq_len")
@@ -372,7 +413,9 @@ class CachedSingleTurnLatentDataset(Dataset):
 
         return {
             "full_latents": payload["full_latents"],
-            "first_frame_latent": payload["first_frame_latent"],
+            "mask_frame_latent": payload["mask_frame_latent"],
+            "source_frame_latent": payload["source_frame_latent"],
+            "edge_weight_map": payload["edge_weight_map"],
             "prompt_embeds": prompt_embeds,
             "prompt_seq_len": int(prompt_seq_len),
             "text": prompt_text,
@@ -381,6 +424,7 @@ class CachedSingleTurnLatentDataset(Dataset):
             "source_image": entry.get("source_image", payload.get("source_image", "")),
             "bg_image": entry.get("bg_image", payload.get("bg_image", "")),
             "mask_check_image": entry.get("mask_check_image", payload.get("mask_check_image", "")),
+            "mask_frame_image": entry.get("mask_frame_image", payload.get("mask_frame_image", "")),
             "mask_sam_image": entry.get("mask_sam_image", payload.get("mask_sam_image", "")),
             "used_mask_sam": bool(entry.get("used_mask_sam", payload.get("used_mask_sam", False))),
             "row_index": int(payload.get("row_index", entry.get("row_index", -1)) or -1),

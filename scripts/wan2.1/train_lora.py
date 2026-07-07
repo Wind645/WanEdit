@@ -102,7 +102,8 @@ from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
                                                generate_singleturn_sample,
                                                normalize_singleturn_sample_size,
                                                prepare_singleturn_noisy_latents,
-                                               preprocess_singleturn_conditioning_image,
+                                               preprocess_singleturn_image,
+                                               preprocess_singleturn_mask_frame,
                                                resize_singleturn_mask_to_latent_grid,
                                                save_singleturn_outputs)
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
@@ -367,15 +368,20 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                 validation_seed = args.singleturn_validation_seed if args.singleturn_validation_seed is not None else args.seed
                 generator = torch.Generator(device=accelerator.device).manual_seed(validation_seed)
 
-            source_tensor = preprocess_singleturn_conditioning_image(
+            sample_size = resolve_singleturn_sample_size(args)
+            source_tensor = preprocess_singleturn_image(
                 args.singleturn_validation_image_path,
+                sample_size,
+            ).to(device=accelerator.device, dtype=weight_dtype)
+            mask_frame_tensor = preprocess_singleturn_mask_frame(
                 args.singleturn_validation_mask_path,
-                resolve_singleturn_sample_size(args),
+                sample_size,
             ).to(device=accelerator.device, dtype=weight_dtype)
 
             with torch.no_grad():
                 generation = generate_singleturn_sample(
                     pipeline=pipeline,
+                    mask_frame_tensor=mask_frame_tensor,
                     source_tensor=source_tensor,
                     negative_prompt=args.singleturn_validation_negative_prompt,
                     guidance_scale=args.singleturn_validation_guidance_scale,
@@ -2141,6 +2147,7 @@ def main():
                 else:
                     if args.singleturn_mode:
                         src_pixel_values = batch["pixel_values_src_image"].to(weight_dtype)
+                        mask_frame_pixel_values = batch["pixel_values_mask_frame"].to(weight_dtype)
                         tgt_pixel_values = batch["pixel_values_tgt_image"].to(weight_dtype)
                         mask_check_pixel_values = batch["pixel_values_mask_check"].to(weight_dtype)
                         batch_texts = [CORNE_SINGLETURN_PROMPT] * src_pixel_values.shape[0]
@@ -2288,6 +2295,7 @@ def main():
                                 except Exception as _:
                                     pass
                         if args.singleturn_mode:
+                            mask_frame_latents = _batch_encode_vae(mask_frame_pixel_values, use_mode=True)
                             source_latents = _batch_encode_vae(src_pixel_values, use_mode=True)
                             target_latents = _batch_encode_vae(tgt_pixel_values, use_mode=True)
                             latent_mask = resize_singleturn_mask_to_latent_grid(mask_check_pixel_values, source_latents)
@@ -2298,7 +2306,8 @@ def main():
                                 dtype=weight_dtype,
                             )
                             latents = build_singleturn_object_removal_latents(
-                                first_frame_latent=source_latents,
+                                mask_frame_latent=mask_frame_latents,
+                                source_frame_latent=source_latents,
                                 bg_latent=target_latents,
                                 mask_check_latent=latent_mask,
                                 noise_latent=noise_latents,

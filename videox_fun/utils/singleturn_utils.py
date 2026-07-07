@@ -11,11 +11,9 @@ from videox_fun.pipeline.pipeline_wan import retrieve_timesteps
 from videox_fun.utils.utils import save_videos_grid
 
 CORNE_SINGLETURN_PROMPT = "Remove the masked object and its side effect"
-SINGLETURN_TOTAL_FRAMES = 7
-SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 1
-SINGLETURN_TAIL_START = 1
-SINGLETURN_MASK_GRAY_VALUE = 0.5
-SINGLETURN_MASK_ALPHA = 0.7
+SINGLETURN_TOTAL_FRAMES = 8
+SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 2
+SINGLETURN_TAIL_START = 2
 
 
 def format_singleturn_prompt(prompt: Optional[str] = None, prompt_template: Optional[str] = None) -> str:
@@ -135,23 +133,7 @@ def preprocess_singleturn_mask(
     return _add_singleturn_dims(mask_tensor, add_batch_dim=add_batch_dim, add_frame_dim=add_frame_dim)
 
 
-def apply_singleturn_gray_mask_overlay(image_tensor: torch.Tensor, mask_tensor: torch.Tensor) -> torch.Tensor:
-    if image_tensor.ndim != 3:
-        raise ValueError(f"image_tensor must have shape (3, H, W), got {tuple(image_tensor.shape)}")
-    if mask_tensor.ndim != 3 or mask_tensor.shape[0] != 1:
-        raise ValueError(f"mask_tensor must have shape (1, H, W), got {tuple(mask_tensor.shape)}")
-    if image_tensor.shape[1:] != mask_tensor.shape[1:]:
-        raise ValueError(
-            f"image_tensor and mask_tensor must share spatial size, got {tuple(image_tensor.shape)} and {tuple(mask_tensor.shape)}"
-        )
-
-    binary_mask = mask_tensor.clamp(0, 1)
-    gray = torch.full_like(image_tensor, SINGLETURN_MASK_GRAY_VALUE)
-    return image_tensor * (1.0 - binary_mask * SINGLETURN_MASK_ALPHA) + gray * (binary_mask * SINGLETURN_MASK_ALPHA)
-
-
-def preprocess_singleturn_conditioning_image(
-    image_source,
+def preprocess_singleturn_mask_frame(
     mask_source,
     sample_size: int | Sequence[int],
     *,
@@ -159,10 +141,9 @@ def preprocess_singleturn_conditioning_image(
     add_frame_dim: bool = True,
 ) -> torch.Tensor:
     sample_size = normalize_singleturn_sample_size(sample_size)
-    rgb_tensor = _letterbox_rgb_tensor(_load_pil_image(image_source), sample_size)
     mask_tensor = _letterbox_mask_tensor(_load_pil_mask(mask_source), sample_size)
-    masked_rgb_tensor = apply_singleturn_gray_mask_overlay(rgb_tensor, mask_tensor)
-    tensor = _normalize_rgb_tensor(masked_rgb_tensor)
+    rgb_tensor = mask_tensor.repeat(3, 1, 1)
+    tensor = _normalize_rgb_tensor(rgb_tensor)
     return _add_singleturn_dims(tensor, add_batch_dim=add_batch_dim, add_frame_dim=add_frame_dim)
 
 
@@ -180,14 +161,15 @@ def _ensure_matching_shapes(reference: torch.Tensor, other: torch.Tensor, other_
         )
 
 
-def _normalize_singleturn_source_latent(source_latent: torch.Tensor) -> torch.Tensor:
-    if not torch.is_tensor(source_latent):
-        raise TypeError(f"source_latent must be a torch.Tensor, got {type(source_latent)}")
-    if source_latent.ndim == 4:
-        return source_latent.unsqueeze(0)
-    if source_latent.ndim == 5:
-        return source_latent
-    raise ValueError(f"source_latent must have shape (B, C, 1, H, W) or (C, 1, H, W), got {tuple(source_latent.shape)}")
+def _normalize_singleturn_prefix_latent(name: str, latent: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(latent):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(latent)}")
+    if latent.ndim == 4:
+        latent = latent.unsqueeze(0)
+    elif latent.ndim != 5:
+        raise ValueError(f"{name} must have shape (B, C, 1, H, W) or (C, 1, H, W), got {tuple(latent.shape)}")
+    _ensure_singleturn_latent_shape(name, latent)
+    return latent
 
 
 def _normalize_singleturn_prompt_context(
@@ -257,39 +239,43 @@ def resize_singleturn_mask_to_latent_grid(mask: torch.Tensor, latent: torch.Tens
 
 
 def build_singleturn_object_removal_latents(
-    first_frame_latent: torch.Tensor,
+    mask_frame_latent: torch.Tensor,
+    source_frame_latent: torch.Tensor,
     bg_latent: torch.Tensor,
     mask_check_latent: torch.Tensor,
     noise_latent: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    _ensure_singleturn_latent_shape("first_frame_latent", first_frame_latent)
+    _ensure_singleturn_latent_shape("mask_frame_latent", mask_frame_latent)
+    _ensure_singleturn_latent_shape("source_frame_latent", source_frame_latent)
     _ensure_singleturn_latent_shape("bg_latent", bg_latent)
-    _ensure_matching_shapes(first_frame_latent, bg_latent, "bg_latent")
+    _ensure_matching_shapes(source_frame_latent, mask_frame_latent, "mask_frame_latent")
+    _ensure_matching_shapes(source_frame_latent, bg_latent, "bg_latent")
 
     if mask_check_latent.ndim != 5 or mask_check_latent.shape[1] != 1 or mask_check_latent.shape[2] != 1:
         raise ValueError(
             "mask_check_latent must have shape (B, 1, 1, H, W), "
             f"got {tuple(mask_check_latent.shape)}"
         )
-    if mask_check_latent.shape[0] != first_frame_latent.shape[0] or mask_check_latent.shape[-2:] != first_frame_latent.shape[-2:]:
+    if mask_check_latent.shape[0] != source_frame_latent.shape[0] or mask_check_latent.shape[-2:] != source_frame_latent.shape[-2:]:
         raise ValueError(
-            "mask_check_latent must match first_frame_latent batch/spatial size, "
-            f"got {tuple(mask_check_latent.shape)} and {tuple(first_frame_latent.shape)}"
+            "mask_check_latent must match source_frame_latent batch/spatial size, "
+            f"got {tuple(mask_check_latent.shape)} and {tuple(source_frame_latent.shape)}"
         )
 
     if noise_latent is None:
-        noise_latent = torch.randn_like(first_frame_latent)
+        noise_latent = torch.randn_like(source_frame_latent)
     else:
         _ensure_singleturn_latent_shape("noise_latent", noise_latent)
-        _ensure_matching_shapes(first_frame_latent, noise_latent, "noise_latent")
+        _ensure_matching_shapes(source_frame_latent, noise_latent, "noise_latent")
 
-    mask = mask_check_latent.to(dtype=torch.bool).expand_as(first_frame_latent)
-    noisy_anchor = torch.where(mask, noise_latent, first_frame_latent)
+    mask = mask_check_latent.to(dtype=torch.bool).expand_as(source_frame_latent)
+    noisy_anchor = torch.where(mask, noise_latent, source_frame_latent)
 
     frames = [
-        first_frame_latent,
-        _interp(first_frame_latent, noisy_anchor, 1.0 / 3.0),
-        _interp(first_frame_latent, noisy_anchor, 2.0 / 3.0),
+        mask_frame_latent,
+        source_frame_latent,
+        _interp(source_frame_latent, noisy_anchor, 1.0 / 3.0),
+        _interp(source_frame_latent, noisy_anchor, 2.0 / 3.0),
         noisy_anchor,
         _interp(noisy_anchor, bg_latent, 1.0 / 3.0),
         _interp(noisy_anchor, bg_latent, 2.0 / 3.0),
@@ -298,40 +284,67 @@ def build_singleturn_object_removal_latents(
     return torch.cat(frames, dim=2)
 
 
-def build_singleturn_training_latents(
-    source_latent: torch.Tensor,
-    target_latent: torch.Tensor,
-    anchor_noise: torch.Tensor,
+def build_singleturn_edge_weight_map(
+    mask_check_latent: torch.Tensor,
+    *,
+    total_frames: int = SINGLETURN_TOTAL_FRAMES,
+    prefix_frames: int = SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
+    peak_weight: float = 1.2,
+    radius: int = 2,
 ) -> torch.Tensor:
-    return build_singleturn_object_removal_latents(source_latent, target_latent, torch.ones_like(source_latent[:, :1]), anchor_noise)
+    if mask_check_latent.ndim != 5 or mask_check_latent.shape[1] != 1 or mask_check_latent.shape[2] != 1:
+        raise ValueError(
+            "mask_check_latent must have shape (B, 1, 1, H, W), "
+            f"got {tuple(mask_check_latent.shape)}"
+        )
+    if peak_weight < 1.0:
+        raise ValueError(f"peak_weight must be >= 1.0, got {peak_weight}")
+    if radius < 1:
+        raise ValueError(f"radius must be >= 1, got {radius}")
+    if prefix_frames < 0 or prefix_frames >= total_frames:
+        raise ValueError(f"prefix_frames must be in [0, {total_frames - 1}], got {prefix_frames}")
+
+    mask_2d = (mask_check_latent[:, :, 0] >= 0.5).float()
+    dilated = F.max_pool2d(mask_2d, kernel_size=3, stride=1, padding=1)
+    eroded = -F.max_pool2d(-mask_2d, kernel_size=3, stride=1, padding=1)
+    boundary = (dilated - eroded > 0).float()
+
+    weights_2d = torch.ones_like(mask_2d)
+    for distance in range(radius):
+        if distance == 0:
+            band = boundary
+        else:
+            band = F.max_pool2d(boundary, kernel_size=2 * distance + 1, stride=1, padding=distance)
+        band_weight = 1.0 + (peak_weight - 1.0) * float(radius - distance) / float(radius)
+        weights_2d = torch.maximum(weights_2d, torch.where(band > 0, torch.full_like(weights_2d, band_weight), torch.ones_like(weights_2d)))
+
+    edge_weight_map = weights_2d.unsqueeze(2).repeat(1, 1, total_frames, 1, 1)
+    edge_weight_map[:, :, :prefix_frames] = 0
+    return edge_weight_map.to(dtype=mask_check_latent.dtype)
 
 
-def build_singleturn_first_frame_inference_latents(
-    first_frame_latent: torch.Tensor,
+def build_singleturn_prefix_inference_latents(
+    mask_frame_latent: torch.Tensor,
+    source_frame_latent: torch.Tensor,
     tail_noise: torch.Tensor,
 ) -> torch.Tensor:
-    _ensure_singleturn_latent_shape("first_frame_latent", first_frame_latent)
+    _ensure_singleturn_latent_shape("mask_frame_latent", mask_frame_latent)
+    _ensure_singleturn_latent_shape("source_frame_latent", source_frame_latent)
+    _ensure_matching_shapes(source_frame_latent, mask_frame_latent, "mask_frame_latent")
     if tail_noise.ndim != 5:
         raise ValueError(f"tail_noise must have shape (B, C, T, H, W), got {tuple(tail_noise.shape)}")
-    if tail_noise.shape[2] != SINGLETURN_TOTAL_FRAMES - 1:
+    if tail_noise.shape[2] != SINGLETURN_TOTAL_FRAMES - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES:
         raise ValueError(
-            f"tail_noise must contain exactly {SINGLETURN_TOTAL_FRAMES - 1} latent frames, got {tail_noise.shape[2]}"
+            "tail_noise must contain exactly "
+            f"{SINGLETURN_TOTAL_FRAMES - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES} latent frames, "
+            f"got {tail_noise.shape[2]}"
         )
-    if first_frame_latent.shape[:2] + first_frame_latent.shape[3:] != tail_noise.shape[:2] + tail_noise.shape[3:]:
+    if source_frame_latent.shape[:2] + source_frame_latent.shape[3:] != tail_noise.shape[:2] + tail_noise.shape[3:]:
         raise ValueError(
-            "tail_noise must match first_frame_latent batch/channel/spatial shape. "
-            f"Got {tuple(first_frame_latent.shape)} and {tuple(tail_noise.shape)}."
+            "tail_noise must match source_frame_latent batch/channel/spatial shape. "
+            f"Got {tuple(source_frame_latent.shape)} and {tuple(tail_noise.shape)}."
         )
-    return torch.cat([first_frame_latent, tail_noise], dim=2)
-
-
-def build_singleturn_inference_latents(
-    source_latent: torch.Tensor,
-    anchor_noise: torch.Tensor,
-    tail_noise: torch.Tensor,
-) -> torch.Tensor:
-    del anchor_noise
-    return build_singleturn_first_frame_inference_latents(source_latent, tail_noise)
+    return torch.cat([mask_frame_latent, source_frame_latent, tail_noise], dim=2)
 
 
 def build_singleturn_loss_mask_like(
@@ -340,7 +353,7 @@ def build_singleturn_loss_mask_like(
     prefix_frames: int = SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
 ) -> torch.Tensor:
     if latents.ndim != 5 or latents.shape[2] != SINGLETURN_TOTAL_FRAMES:
-        raise ValueError(f"latents must have shape (B, C, 7, H, W), got {tuple(latents.shape)}")
+        raise ValueError(f"latents must have shape (B, C, {SINGLETURN_TOTAL_FRAMES}, H, W), got {tuple(latents.shape)}")
     if prefix_frames <= 0 or prefix_frames >= SINGLETURN_TOTAL_FRAMES:
         raise ValueError(f"prefix_frames must be in [1, {SINGLETURN_TOTAL_FRAMES - 1}], got {prefix_frames}")
     mask = torch.ones_like(latents)
@@ -358,7 +371,7 @@ def prepare_singleturn_noisy_latents(
     if latents.shape != noise.shape:
         raise ValueError(f"latents and noise must share the same shape, got {tuple(latents.shape)} and {tuple(noise.shape)}")
     if latents.ndim != 5 or latents.shape[2] != SINGLETURN_TOTAL_FRAMES:
-        raise ValueError(f"latents must have shape (B, C, 7, H, W), got {tuple(latents.shape)}")
+        raise ValueError(f"latents must have shape (B, C, {SINGLETURN_TOTAL_FRAMES}, H, W), got {tuple(latents.shape)}")
 
     noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
     noisy_latents[:, :, :prefix_frames] = latents[:, :, :prefix_frames]
@@ -397,7 +410,8 @@ def compute_wan_seq_len_from_latents(latents: torch.Tensor, patch_size: tuple[in
 
 def _run_singleturn_generation(
     pipeline,
-    first_frame_latent: torch.Tensor,
+    mask_frame_latent: torch.Tensor,
+    source_frame_latent: torch.Tensor,
     prompt_context: List[torch.Tensor],
     negative_prompt_context: Optional[List[torch.Tensor]] = None,
     guidance_scale: float = 5.0,
@@ -408,13 +422,22 @@ def _run_singleturn_generation(
     device = pipeline._execution_device
     do_classifier_free_guidance = guidance_scale > 1.0
     weight_dtype = weight_dtype or getattr(pipeline.transformer, "dtype", torch.float32)
-    first_frame_latent = _normalize_singleturn_source_latent(first_frame_latent).to(device=device, dtype=weight_dtype)
+    mask_frame_latent = _normalize_singleturn_prefix_latent("mask_frame_latent", mask_frame_latent).to(
+        device=device,
+        dtype=weight_dtype,
+    )
+    source_frame_latent = _normalize_singleturn_prefix_latent("source_frame_latent", source_frame_latent).to(
+        device=device,
+        dtype=weight_dtype,
+    )
+    _ensure_matching_shapes(source_frame_latent, mask_frame_latent, "mask_frame_latent")
     prompt_context = [embed.to(device=device, dtype=weight_dtype) for embed in prompt_context]
     if not prompt_context:
         raise ValueError("prompt_context must not be empty.")
-    if first_frame_latent.shape[0] != len(prompt_context):
+    if source_frame_latent.shape[0] != len(prompt_context):
         raise ValueError(
-            f"first_frame_latent batch size {first_frame_latent.shape[0]} does not match prompt_context size {len(prompt_context)}."
+            "source_frame_latent batch size "
+            f"{source_frame_latent.shape[0]} does not match prompt_context size {len(prompt_context)}."
         )
 
     if do_classifier_free_guidance:
@@ -438,17 +461,17 @@ def _run_singleturn_generation(
     extra_step_kwargs = pipeline.prepare_extra_step_kwargs(generator, eta=0.0)
     tail_noise = torch.randn(
         (
-            first_frame_latent.shape[0],
-            first_frame_latent.shape[1],
-            SINGLETURN_TOTAL_FRAMES - 1,
-            first_frame_latent.shape[3],
-            first_frame_latent.shape[4],
+            source_frame_latent.shape[0],
+            source_frame_latent.shape[1],
+            SINGLETURN_TOTAL_FRAMES - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
+            source_frame_latent.shape[3],
+            source_frame_latent.shape[4],
         ),
         device=device,
         generator=generator,
         dtype=weight_dtype,
     )
-    latents = build_singleturn_first_frame_inference_latents(first_frame_latent, tail_noise)
+    latents = build_singleturn_prefix_inference_latents(mask_frame_latent, source_frame_latent, tail_noise)
     seq_len = compute_wan_seq_len_from_latents(latents, pipeline.transformer.config.patch_size)
 
     def autocast_context():
@@ -496,6 +519,7 @@ def _run_singleturn_generation(
 
 def generate_singleturn_sample(
     pipeline,
+    mask_frame_tensor: torch.Tensor,
     source_tensor: torch.Tensor,
     prompt: Optional[str] = None,
     prompt_template: Optional[str] = None,
@@ -521,7 +545,8 @@ def generate_singleturn_sample(
     )
     return _run_singleturn_generation(
         pipeline=pipeline,
-        first_frame_latent=pipeline.vae.encode(source_tensor.permute(0, 2, 1, 3, 4))[0].mode(),
+        mask_frame_latent=pipeline.vae.encode(mask_frame_tensor.permute(0, 2, 1, 3, 4))[0].mode(),
+        source_frame_latent=pipeline.vae.encode(source_tensor.permute(0, 2, 1, 3, 4))[0].mode(),
         prompt_context=prompt_embeds,
         negative_prompt_context=negative_prompt_embeds,
         guidance_scale=guidance_scale,
@@ -533,7 +558,8 @@ def generate_singleturn_sample(
 
 def generate_singleturn_sample_from_latents(
     pipeline,
-    source_latent: torch.Tensor,
+    mask_frame_latent: torch.Tensor,
+    source_frame_latent: torch.Tensor,
     prompt_embeds: torch.Tensor | List[torch.Tensor],
     prompt_seq_len: Optional[int | Sequence[int]] = None,
     negative_prompt: str = "",
@@ -557,7 +583,8 @@ def generate_singleturn_sample_from_latents(
         )
     return _run_singleturn_generation(
         pipeline=pipeline,
-        first_frame_latent=source_latent,
+        mask_frame_latent=mask_frame_latent,
+        source_frame_latent=source_frame_latent,
         prompt_context=prompt_context,
         negative_prompt_context=negative_prompt_context,
         guidance_scale=guidance_scale,
@@ -596,8 +623,8 @@ def save_singleturn_outputs(
 
     full_gif = os.path.join(output_dir, f"{stem}_full.gif")
     tail_gif = os.path.join(output_dir, f"{stem}_tail.gif")
-    full_last = os.path.join(output_dir, f"{stem}_frame7.png")
-    tail_last = os.path.join(output_dir, f"{stem}_tail_frame7.png")
+    full_last = os.path.join(output_dir, f"{stem}_frame8.png")
+    tail_last = os.path.join(output_dir, f"{stem}_tail_frame8.png")
 
     save_videos_grid(full_frames, full_gif, fps=fps)
     save_videos_grid(tail_frames, tail_gif, fps=fps)

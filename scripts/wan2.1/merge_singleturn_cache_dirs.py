@@ -100,9 +100,16 @@ def main():
         json.dump(merged_manifest, f, indent=2)
 
     merged_metadata = {
+        "mode": metadata_list[0].get("mode", "singleturn_object_removal_v2"),
         "dataset_type": "corne_object_removal",
+        "conditioning_format": metadata_list[0].get("conditioning_format", ""),
+        "prefix_frames": metadata_list[0].get("prefix_frames"),
+        "total_frames": metadata_list[0].get("total_frames"),
+        "pixel_space_source_masking": metadata_list[0].get("pixel_space_source_masking", False),
         "max_samples_with_mask_sam": sum(int(meta.get("max_samples_with_mask_sam", 0)) for meta in metadata_list),
         "max_samples_without_mask_sam": sum(int(meta.get("max_samples_without_mask_sam", 0)) for meta in metadata_list),
+        "skip_samples_with_mask_sam": sum(int(meta.get("skip_samples_with_mask_sam", 0)) for meta in metadata_list),
+        "skip_samples_without_mask_sam": sum(int(meta.get("skip_samples_without_mask_sam", 0)) for meta in metadata_list),
         "num_samples_with_mask_sam": sum(int(meta.get("num_samples_with_mask_sam", 0)) for meta in metadata_list),
         "num_samples_without_mask_sam": sum(int(meta.get("num_samples_without_mask_sam", 0)) for meta in metadata_list),
         "stopped_early_when_quotas_met": all(bool(meta.get("stopped_early_when_quotas_met", False)) for meta in metadata_list),
