@@ -98,6 +98,7 @@ from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import create_network, merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
                                                build_singleturn_object_removal_latents,
+                                               build_singleturn_loss_mask_like,
                                                compute_wan_seq_len_from_latents,
                                                generate_singleturn_sample,
                                                normalize_singleturn_sample_size,
@@ -105,6 +106,7 @@ from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
                                                preprocess_singleturn_image,
                                                preprocess_singleturn_mask_frame,
                                                resize_singleturn_mask_to_latent_grid,
+                                               SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
                                                save_singleturn_outputs)
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
 
@@ -186,12 +188,16 @@ def load_cached_batch(batch, weight_dtype, device):
     return latents, prompt_embeds
 
 
-def load_cached_singleturn_batch(batch, weight_dtype, device):
-    full_latents = batch["full_latents"].to(device=device, dtype=weight_dtype, non_blocking=True)
+def load_cached_singleturn_batch(batch, weight_dtype, device, refinement_mode=False):
+    latent_key = "input_latents" if refinement_mode else "full_latents"
+    full_latents = batch[latent_key].to(device=device, dtype=weight_dtype, non_blocking=True)
     prompt_embeds_padded = batch["prompt_embeds"].to(device=device, dtype=weight_dtype, non_blocking=True)
     prompt_seq_lens = batch["prompt_seq_len"].tolist()
     prompt_embeds = [embed[:seq_len] for embed, seq_len in zip(prompt_embeds_padded, prompt_seq_lens)]
-    return full_latents, prompt_embeds
+    target_latents = None
+    if refinement_mode:
+        target_latents = batch["target_latents"].to(device=device, dtype=weight_dtype, non_blocking=True)
+    return full_latents, prompt_embeds, target_latents
 
 
 def load_singleturn_shared_prompt_cache(prompt_cache_path, weight_dtype, device):
@@ -328,6 +334,9 @@ def log_singleturn_validation_to_wandb(args, global_step, source_image_path, for
 def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer3d, network, config, args, accelerator, weight_dtype, global_step):
     try:
         if getattr(args, "singleturn_mode", False):
+            if getattr(args, "singleturn_refine_mode", False):
+                logger.info("Skipping SingleTurn refinement validation because the validation hook only supports coarse generation.")
+                return
             if not args.singleturn_validation_image_path or not args.singleturn_validation_mask_path:
                 logger.info("Skipping SingleTurn validation because no validation image/mask pair was provided.")
                 return
@@ -971,6 +980,11 @@ def parse_args():
         help="Enable SingleTurn image-edit training with a dedicated image-pair dataset and 7-frame latent recipe.",
     )
     parser.add_argument(
+        "--singleturn_refine_mode",
+        action="store_true",
+        help="Enable cached SingleTurn refinement training on coarse latent trajectories with a one-step tail correction target.",
+    )
+    parser.add_argument(
         "--singleturn_reconstruction_mode",
         action="store_true",
         help="Deprecated and unsupported for CORNE object-removal mode.",
@@ -1156,11 +1170,20 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
+    if args.singleturn_refine_mode and not args.singleturn_mode:
+        raise ValueError("SingleTurn refinement mode requires --singleturn_mode.")
+
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
         args.non_ema_revision = args.revision
 
     if args.singleturn_mode:
+        if args.singleturn_refine_mode and args.cached_data_meta is None:
+            raise ValueError("SingleTurn refinement mode requires --cached_data_meta.")
+        if args.singleturn_refine_mode and args.train_data_dir is not None:
+            raise ValueError("SingleTurn refinement mode uses cached latents only and does not accept --train_data_dir.")
+        if args.singleturn_refine_mode and args.train_data_manifest is not None:
+            raise ValueError("SingleTurn refinement mode does not accept --train_data_manifest.")
         if args.singleturn_reconstruction_mode:
             raise ValueError("CORNE object-removal SingleTurn mode no longer supports --singleturn_reconstruction_mode.")
         if args.singleturn_reconstruction_prompt_cache is not None:
@@ -1639,7 +1662,12 @@ def main():
 
     if use_cached_data:
         if args.singleturn_mode:
-            train_dataset = CachedSingleTurnLatentDataset(args.cached_data_meta, args.cached_data_dir)
+            expected_mode = "singleturn_object_removal_refine_v1" if args.singleturn_refine_mode else "singleturn_object_removal_v2"
+            train_dataset = CachedSingleTurnLatentDataset(
+                args.cached_data_meta,
+                args.cached_data_dir,
+                expected_mode=expected_mode,
+            )
         else:
             train_dataset = CachedVideoLatentDataset(args.cached_data_meta, args.cached_data_dir)
         train_dataloader = torch.utils.data.DataLoader(
@@ -2128,13 +2156,15 @@ def main():
             with accelerator.accumulate(transformer3d):
                 batch_texts = None
                 singleturn_loss_mask = None
+                singleturn_refine_target_latents = None
                 if use_cached_data:
                     with torch.no_grad():
                         if args.singleturn_mode:
-                            latents, prompt_embeds = load_cached_singleturn_batch(
+                            latents, prompt_embeds, singleturn_refine_target_latents = load_cached_singleturn_batch(
                                 batch=batch,
                                 weight_dtype=weight_dtype,
                                 device=accelerator.device,
+                                refinement_mode=args.singleturn_refine_mode,
                             )
                         else:
                             latents, prompt_embeds = load_cached_batch(
@@ -2401,24 +2431,25 @@ def main():
                         torch.cuda.empty_cache()
 
                 bsz, channel, num_frames, height, width = latents.size()
-                noise = torch.randn(latents.size(), device=latents.device, generator=torch_rng, dtype=weight_dtype)
-
-                if not args.uniform_sampling:
-                    u = compute_density_for_timestep_sampling(
-                        weighting_scheme=args.weighting_scheme,
-                        batch_size=bsz,
-                        logit_mean=args.logit_mean,
-                        logit_std=args.logit_std,
-                        mode_scale=args.mode_scale,
-                    )
-                    indices = (u * noise_scheduler.config.num_train_timesteps).long()
+                if args.singleturn_refine_mode:
+                    noise = None
+                    timesteps = torch.zeros((bsz,), device=latents.device, dtype=noise_scheduler.timesteps.dtype)
                 else:
-                    # Sample a random timestep for each image
-                    # timesteps = generate_timestep_with_lognorm(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
-                    # timesteps = torch.randint(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
-                    indices = idx_sampling(bsz, generator=torch_rng, device=latents.device)
-                    indices = indices.long().cpu()
-                timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
+                    noise = torch.randn(latents.size(), device=latents.device, generator=torch_rng, dtype=weight_dtype)
+
+                    if not args.uniform_sampling:
+                        u = compute_density_for_timestep_sampling(
+                            weighting_scheme=args.weighting_scheme,
+                            batch_size=bsz,
+                            logit_mean=args.logit_mean,
+                            logit_std=args.logit_std,
+                            mode_scale=args.mode_scale,
+                        )
+                        indices = (u * noise_scheduler.config.num_train_timesteps).long()
+                    else:
+                        indices = idx_sampling(bsz, generator=torch_rng, device=latents.device)
+                        indices = indices.long().cpu()
+                    timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
 
                 def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
                     sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
@@ -2433,19 +2464,27 @@ def main():
 
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
-                sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
-                if args.singleturn_mode:
-                    noisy_latents, target, singleturn_loss_mask = prepare_singleturn_noisy_latents(latents, noise, sigmas)
+                if args.singleturn_refine_mode:
+                    noisy_latents = latents
+                    target = singleturn_refine_target_latents - latents
+                    singleturn_loss_mask = build_singleturn_loss_mask_like(
+                        latents,
+                        prefix_frames=SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
+                    )
                 else:
-                    noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+                    sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
+                    if args.singleturn_mode:
+                        noisy_latents, target, singleturn_loss_mask = prepare_singleturn_noisy_latents(latents, noise, sigmas)
+                    else:
+                        noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
-                    #####temporal in context init ##############
-                    edited_start_frame = (args.source_frames) // 4 + 1
-                    noisy_latents[:, :, :edited_start_frame] = latents[:, :, :edited_start_frame]
-                    #####temporal in context init ##############
+                        #####temporal in context init ##############
+                        edited_start_frame = (args.source_frames) // 4 + 1
+                        noisy_latents[:, :, :edited_start_frame] = latents[:, :, :edited_start_frame]
+                        #####temporal in context init ##############
 
-                    # Add noise
-                    target = noise - latents
+                        # Add noise
+                        target = noise - latents
 
                 seq_len = compute_wan_seq_len_from_latents(
                     latents,
@@ -2476,29 +2515,32 @@ def main():
                     final_loss = masked_loss.mean()
                     return final_loss
                 
-                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
-                # loss = custom_mse_loss(noise_pred.float(), target.float(), weighting.float())
-                # loss = loss.mean()
-                # Check if video edit loss mode is enabled
-                if args.singleturn_mode:
-                    loss = custom_mse_loss(
-                        noise_pred.float(),
-                        target.float(),
-                        weighting.float(),
-                        loss_mask=singleturn_loss_mask.float(),
-                    )
-                elif args.video_edit_loss_on_edited_frames_only:
-                    # For video editing: only compute loss on edited frames (second half)
-                    # Calculate latent frame indices for edited frames
-                    source_frames_latent = (args.source_frames - 1) // 4 + 1  # Convert to latent space
-                    edited_start_frame = source_frames_latent
-                    # Extract edited frames latents
-                    noise_pred_edited = noise_pred[:, :, edited_start_frame:, :, :]
-                    target_edited = target[:, :, edited_start_frame:, :, :]
-                    loss = custom_mse_loss(noise_pred_edited.float(), target_edited.float(), weighting.float())
+                if args.singleturn_refine_mode:
+                    loss_mask = singleturn_loss_mask.float()
+                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                    loss = (loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
                 else:
-                    # Standard loss calculation for all frames
-                    loss = custom_mse_loss(noise_pred.float(), target.float(), weighting.float())
+                    weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+                    # Check if video edit loss mode is enabled
+                    if args.singleturn_mode:
+                        loss = custom_mse_loss(
+                            noise_pred.float(),
+                            target.float(),
+                            weighting.float(),
+                            loss_mask=singleturn_loss_mask.float(),
+                        )
+                    elif args.video_edit_loss_on_edited_frames_only:
+                        # For video editing: only compute loss on edited frames (second half)
+                        # Calculate latent frame indices for edited frames
+                        source_frames_latent = (args.source_frames - 1) // 4 + 1  # Convert to latent space
+                        edited_start_frame = source_frames_latent
+                        # Extract edited frames latents
+                        noise_pred_edited = noise_pred[:, :, edited_start_frame:, :, :]
+                        target_edited = target[:, :, edited_start_frame:, :, :]
+                        loss = custom_mse_loss(noise_pred_edited.float(), target_edited.float(), weighting.float())
+                    else:
+                        # Standard loss calculation for all frames
+                        loss = custom_mse_loss(noise_pred.float(), target.float(), weighting.float())
 
                 if args.motion_sub_loss and noise_pred.size()[1] > 2:
                     gt_sub_noise = noise_pred[:, :, 1:].float() - noise_pred[:, :, :-1].float()

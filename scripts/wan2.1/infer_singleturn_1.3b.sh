@@ -15,6 +15,9 @@ export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
 export OUTPUT_DIR=${OUTPUT_DIR:-outputs/singleturn_object_removal_v3_twoprefix}
 export LORA_PATH=${LORA_PATH:-}
+export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
+export REFINEMENT_LORA_PATH=${REFINEMENT_LORA_PATH:-}
+export REFINEMENT_LORA_ALPHA=${REFINEMENT_LORA_ALPHA:-1.0}
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-50}
@@ -104,6 +107,18 @@ fi
 
 if [[ -n "${LORA_PATH}" ]]; then
   cmd+=(--lora_path "$LORA_PATH")
+fi
+
+if [[ "${ENABLE_REFINEMENT}" == "1" ]]; then
+  if [[ -z "${REFINEMENT_LORA_PATH}" ]]; then
+    echo "REFINEMENT_LORA_PATH must be set when ENABLE_REFINEMENT=1." >&2
+    exit 1
+  fi
+  cmd+=(
+    --enable_refinement
+    --refinement_lora_path "$REFINEMENT_LORA_PATH"
+    --refinement_lora_alpha "$REFINEMENT_LORA_ALPHA"
+  )
 fi
 
 echo "Running: ${cmd[*]}"

@@ -333,13 +333,19 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
 
 
 class CachedSingleTurnLatentDataset(Dataset):
-    def __init__(self, manifest_path: str, data_root: Optional[str] = None):
+    def __init__(
+        self,
+        manifest_path: str,
+        data_root: Optional[str] = None,
+        expected_mode: str = "singleturn_object_removal_v2",
+    ):
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
         if not isinstance(manifest, list) or not manifest:
             raise ValueError("SingleTurn cached manifest must be a non-empty list.")
         self.data_root = data_root
         self.manifest = manifest
+        self.expected_mode = expected_mode
         self._shared_prompt_cache_payloads: Dict[str, Dict[str, Any]] = {}
 
     def __len__(self) -> int:
@@ -374,24 +380,11 @@ class CachedSingleTurnLatentDataset(Dataset):
                 "Re-run preprocess_singleturn_cache.py to generate CORNE object-removal caches."
             )
 
-        expected_mode = payload.get("mode")
-        if expected_mode != "singleturn_object_removal_v2":
+        payload_mode = payload.get("mode")
+        if payload_mode != self.expected_mode:
             raise ValueError(
-                f"Cached SingleTurn sample {cache_path} has unsupported mode={expected_mode!r}. "
-                "Re-run preprocess_singleturn_cache.py to generate 8-frame two-prefix CORNE caches."
-            )
-
-        missing = [
-            key
-            for key in ("full_latents", "mask_frame_latent", "source_frame_latent", "edge_weight_map")
-            if key not in payload
-        ]
-        if missing:
-            raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}")
-        if payload["full_latents"].shape[-3] != SINGLETURN_TOTAL_FRAMES:
-            raise ValueError(
-                f"Cached SingleTurn sample {cache_path} has {payload['full_latents'].shape[-3]} frames; "
-                f"expected {SINGLETURN_TOTAL_FRAMES}."
+                f"Cached SingleTurn sample {cache_path} has unsupported mode={payload_mode!r}. "
+                f"Expected mode={self.expected_mode!r}."
             )
 
         prompt_embeds = payload.get("prompt_embeds")
@@ -411,11 +404,7 @@ class CachedSingleTurnLatentDataset(Dataset):
                 f"Cached SingleTurn sample {cache_path} must contain prompt_embeds/prompt_seq_len or shared_prompt_cache."
             )
 
-        return {
-            "full_latents": payload["full_latents"],
-            "mask_frame_latent": payload["mask_frame_latent"],
-            "source_frame_latent": payload["source_frame_latent"],
-            "edge_weight_map": payload["edge_weight_map"],
+        sample = {
             "prompt_embeds": prompt_embeds,
             "prompt_seq_len": int(prompt_seq_len),
             "text": prompt_text,
@@ -432,6 +421,54 @@ class CachedSingleTurnLatentDataset(Dataset):
             "data_type": "image",
             "idx": index,
         }
+        if self.expected_mode == "singleturn_object_removal_v2":
+            missing = [
+                key
+                for key in ("full_latents", "mask_frame_latent", "source_frame_latent", "edge_weight_map")
+                if key not in payload
+            ]
+            if missing:
+                raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}")
+            if payload["full_latents"].shape[-3] != SINGLETURN_TOTAL_FRAMES:
+                raise ValueError(
+                    f"Cached SingleTurn sample {cache_path} has {payload['full_latents'].shape[-3]} frames; "
+                    f"expected {SINGLETURN_TOTAL_FRAMES}."
+                )
+            sample.update(
+                {
+                    "full_latents": payload["full_latents"],
+                    "mask_frame_latent": payload["mask_frame_latent"],
+                    "source_frame_latent": payload["source_frame_latent"],
+                    "edge_weight_map": payload["edge_weight_map"],
+                }
+            )
+            return sample
+
+        if self.expected_mode == "singleturn_object_removal_refine_v1":
+            missing = [key for key in ("input_latents", "target_latents") if key not in payload]
+            if missing:
+                raise ValueError(f"Cached SingleTurn refine sample {cache_path} is missing keys: {missing}")
+            if payload["input_latents"].shape[-3] != SINGLETURN_TOTAL_FRAMES:
+                raise ValueError(
+                    f"Cached SingleTurn refine sample {cache_path} has {payload['input_latents'].shape[-3]} frames; "
+                    f"expected {SINGLETURN_TOTAL_FRAMES}."
+                )
+            if payload["target_latents"].shape != payload["input_latents"].shape:
+                raise ValueError(
+                    "Cached SingleTurn refine sample must store matching input_latents and target_latents shapes, "
+                    f"got {tuple(payload['input_latents'].shape)} and {tuple(payload['target_latents'].shape)}."
+                )
+            sample.update(
+                {
+                    "input_latents": payload["input_latents"],
+                    "target_latents": payload["target_latents"],
+                    "coarse_output_dir": entry.get("coarse_output_dir", payload.get("coarse_output_dir", "")),
+                    "coarse_meta_path": entry.get("coarse_meta_path", payload.get("coarse_meta_path", "")),
+                }
+            )
+            return sample
+
+        raise ValueError(f"Unsupported SingleTurn cached expected_mode={self.expected_mode!r}")
 
 
 class CachedSingleTurnReconstructionDataset(Dataset):

@@ -13,6 +13,7 @@ from videox_fun.utils.utils import save_videos_grid
 CORNE_SINGLETURN_PROMPT = "Remove the masked object and its side effect"
 SINGLETURN_TOTAL_FRAMES = 8
 SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 2
+SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES = 5
 SINGLETURN_TAIL_START = 2
 
 
@@ -356,9 +357,46 @@ def build_singleturn_loss_mask_like(
         raise ValueError(f"latents must have shape (B, C, {SINGLETURN_TOTAL_FRAMES}, H, W), got {tuple(latents.shape)}")
     if prefix_frames <= 0 or prefix_frames >= SINGLETURN_TOTAL_FRAMES:
         raise ValueError(f"prefix_frames must be in [1, {SINGLETURN_TOTAL_FRAMES - 1}], got {prefix_frames}")
+    if prefix_frames + 3 != SINGLETURN_TOTAL_FRAMES:
+        raise ValueError(
+            "SingleTurn refinement target construction expects exactly three editable tail frames "
+            f"(F6/F7/F8), got prefix_frames={prefix_frames} for total_frames={SINGLETURN_TOTAL_FRAMES}."
+        )
     mask = torch.ones_like(latents)
     mask[:, :, :prefix_frames] = 0
     return mask
+
+
+def build_singleturn_refinement_target_latents(
+    coarse_latents: torch.Tensor,
+    gt_last_latent: torch.Tensor,
+    *,
+    prefix_frames: int = SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
+) -> torch.Tensor:
+    if coarse_latents.ndim != 5 or coarse_latents.shape[2] != SINGLETURN_TOTAL_FRAMES:
+        raise ValueError(
+            f"coarse_latents must have shape (B, C, {SINGLETURN_TOTAL_FRAMES}, H, W), got {tuple(coarse_latents.shape)}"
+        )
+    gt_last_latent = _normalize_singleturn_prefix_latent("gt_last_latent", gt_last_latent)
+    if coarse_latents.shape[0] != gt_last_latent.shape[0]:
+        raise ValueError(
+            "coarse_latents batch size does not match gt_last_latent batch size: "
+            f"{coarse_latents.shape[0]} vs {gt_last_latent.shape[0]}"
+        )
+    if coarse_latents.shape[1] != gt_last_latent.shape[1] or coarse_latents.shape[-2:] != gt_last_latent.shape[-2:]:
+        raise ValueError(
+            "coarse_latents and gt_last_latent must share channel and spatial shape. "
+            f"Got {tuple(coarse_latents.shape)} and {tuple(gt_last_latent.shape)}."
+        )
+    if prefix_frames <= 0 or prefix_frames >= SINGLETURN_TOTAL_FRAMES:
+        raise ValueError(f"prefix_frames must be in [1, {SINGLETURN_TOTAL_FRAMES - 1}], got {prefix_frames}")
+
+    target_latents = coarse_latents.clone()
+    anchor = coarse_latents[:, :, prefix_frames - 1 : prefix_frames]
+    target_latents[:, :, prefix_frames : prefix_frames + 1] = _interp(anchor, gt_last_latent, 1.0 / 3.0)
+    target_latents[:, :, prefix_frames + 1 : prefix_frames + 2] = _interp(anchor, gt_last_latent, 2.0 / 3.0)
+    target_latents[:, :, prefix_frames + 2 : prefix_frames + 3] = gt_last_latent
+    return target_latents
 
 
 def prepare_singleturn_noisy_latents(
@@ -399,6 +437,23 @@ def restore_singleturn_prefix(
     updated_latents = updated_latents.clone()
     updated_latents[:, :, :prefix_frames] = frozen_prefix
     return updated_latents
+
+
+def apply_singleturn_refinement_prediction(
+    coarse_latents: torch.Tensor,
+    refinement_pred: torch.Tensor,
+    *,
+    prefix_frames: int = SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
+) -> torch.Tensor:
+    if coarse_latents.shape != refinement_pred.shape:
+        raise ValueError(
+            f"coarse_latents and refinement_pred must share the same shape, got "
+            f"{tuple(coarse_latents.shape)} and {tuple(refinement_pred.shape)}"
+        )
+    frozen_prefix = coarse_latents[:, :, :prefix_frames].clone()
+    refinement_pred = zero_singleturn_prefix_prediction(refinement_pred, prefix_frames=prefix_frames)
+    refined_latents = coarse_latents + refinement_pred
+    return restore_singleturn_prefix(refined_latents, frozen_prefix, prefix_frames=prefix_frames)
 
 
 def compute_wan_seq_len_from_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> int:
@@ -592,6 +647,80 @@ def generate_singleturn_sample_from_latents(
         generator=generator,
         weight_dtype=weight_dtype,
     )
+
+
+def refine_singleturn_sample_from_latents(
+    pipeline,
+    coarse_latents: torch.Tensor,
+    prompt_embeds: torch.Tensor | List[torch.Tensor],
+    prompt_seq_len: Optional[int | Sequence[int]] = None,
+    negative_prompt: str = "",
+    guidance_scale: float = 5.0,
+    weight_dtype: Optional[torch.dtype] = None,
+    max_sequence_length: int = 512,
+    prefix_frames: int = SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
+):
+    device = pipeline._execution_device
+    weight_dtype = weight_dtype or getattr(pipeline.transformer, "dtype", torch.float32)
+    if coarse_latents.ndim == 4:
+        coarse_latents = coarse_latents.unsqueeze(0)
+    if coarse_latents.ndim != 5 or coarse_latents.shape[2] != SINGLETURN_TOTAL_FRAMES:
+        raise ValueError(
+            f"coarse_latents must have shape (B, C, {SINGLETURN_TOTAL_FRAMES}, H, W), got {tuple(coarse_latents.shape)}"
+        )
+
+    coarse_latents = coarse_latents.to(device=device, dtype=weight_dtype)
+    prompt_context = [embed.to(device=device, dtype=weight_dtype) for embed in _normalize_singleturn_prompt_context(prompt_embeds, prompt_seq_len)]
+    negative_prompt_context = None
+    do_classifier_free_guidance = guidance_scale > 1.0
+    if do_classifier_free_guidance:
+        negative_prompt_context = pipeline._get_t5_prompt_embeds(
+            prompt=[negative_prompt or ""] * len(prompt_context),
+            num_videos_per_prompt=1,
+            max_sequence_length=max_sequence_length,
+            device=device,
+            dtype=weight_dtype,
+        )
+        context = negative_prompt_context + prompt_context
+    else:
+        context = prompt_context
+
+    seq_len = compute_wan_seq_len_from_latents(coarse_latents, pipeline.transformer.config.patch_size)
+    refinement_timestep = torch.zeros((coarse_latents.shape[0],), device=device, dtype=weight_dtype)
+
+    def autocast_context():
+        if device.type == "cuda" and weight_dtype != torch.float32:
+            return torch.autocast("cuda", dtype=weight_dtype)
+        return contextlib.nullcontext()
+
+    latent_model_input = torch.cat([coarse_latents] * 2) if do_classifier_free_guidance else coarse_latents
+    refinement_timestep = refinement_timestep.expand(latent_model_input.shape[0])
+
+    with autocast_context():
+        refinement_pred = pipeline.transformer(
+            x=latent_model_input,
+            context=context,
+            t=refinement_timestep,
+            seq_len=seq_len,
+        )
+
+    if do_classifier_free_guidance:
+        refinement_pred_uncond, refinement_pred_text = refinement_pred.chunk(2)
+        refinement_pred = refinement_pred_uncond + guidance_scale * (refinement_pred_text - refinement_pred_uncond)
+
+    refined_latents = apply_singleturn_refinement_prediction(
+        coarse_latents,
+        refinement_pred,
+        prefix_frames=prefix_frames,
+    )
+    full_frames = decode_singleturn_latent_frames(pipeline.vae, refined_latents, decode_dtype=weight_dtype).cpu()
+    tail_frames = full_frames[:, :, SINGLETURN_TAIL_START:].contiguous()
+    return {
+        "formatted_prompt": CORNE_SINGLETURN_PROMPT,
+        "full_frames": full_frames,
+        "tail_frames": tail_frames,
+        "latents": refined_latents.detach().cpu(),
+    }
 
 
 def decode_singleturn_latent_frames(vae, latents: torch.Tensor, decode_dtype: Optional[torch.dtype] = None) -> torch.Tensor:

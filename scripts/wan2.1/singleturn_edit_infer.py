@@ -28,7 +28,7 @@ for project_root in project_roots:
 from videox_fun.data.singleturn_dataset import CachedSingleTurnLatentDataset, load_singleturn_cache_payload
 from videox_fun.models import AutoencoderKLWan, WanT5EncoderModel, WanTransformer3DModel
 from videox_fun.pipeline import WanPipeline
-from videox_fun.utils.lora_utils import merge_lora
+from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
     generate_singleturn_sample,
@@ -37,6 +37,7 @@ from videox_fun.utils.singleturn_utils import (
     preprocess_singleturn_image,
     preprocess_singleturn_mask_frame,
     preprocess_singleturn_mask,
+    refine_singleturn_sample_from_latents,
     save_singleturn_outputs,
 )
 from videox_fun.utils.utils import filter_kwargs
@@ -138,6 +139,35 @@ def _resolve_runtime_device() -> torch.device:
     return torch.device("cuda")
 
 
+def _save_singleturn_variant(
+    *,
+    output_dir: str,
+    stem: str,
+    generation: dict,
+    fps: int,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    return save_singleturn_outputs(
+        full_frames=generation["full_frames"],
+        tail_frames=generation["tail_frames"],
+        output_dir=output_dir,
+        stem=stem,
+        fps=fps,
+    )
+
+
+def _write_singleturn_metadata(
+    *,
+    output_dir: str,
+    stem: str,
+    metadata: dict,
+):
+    metadata_path = os.path.join(output_dir, f"{stem}_meta.json")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    return metadata_path
+
+
 def _save_singleturn_result(
     *,
     output_dir: str,
@@ -146,20 +176,108 @@ def _save_singleturn_result(
     metadata: dict,
     fps: int,
 ):
-    os.makedirs(output_dir, exist_ok=True)
-    output_paths = save_singleturn_outputs(
-        full_frames=generation["full_frames"],
-        tail_frames=generation["tail_frames"],
+    output_paths = _save_singleturn_variant(
         output_dir=output_dir,
         stem=stem,
+        generation=generation,
         fps=fps,
     )
-
-    metadata_path = os.path.join(output_dir, f"{stem}_meta.json")
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump({**metadata, "outputs": output_paths}, f, indent=2)
-
+    metadata_path = _write_singleturn_metadata(
+        output_dir=output_dir,
+        stem=stem,
+        metadata={**metadata, "outputs": output_paths},
+    )
     return output_paths, metadata_path
+
+
+def _enable_refinement_lora(pipeline, args, device: torch.device, weight_dtype: torch.dtype):
+    if args.lora_path:
+        pipeline = unmerge_lora(
+            pipeline,
+            args.lora_path,
+            args.lora_alpha,
+            device=device,
+            dtype=weight_dtype,
+            sub_transformer_name="transformer",
+        )
+    pipeline = merge_lora(
+        pipeline,
+        args.refinement_lora_path,
+        args.refinement_lora_alpha,
+        device=device,
+        dtype=weight_dtype,
+        transformer_only=True,
+    )
+    return pipeline
+
+
+def _restore_coarse_lora(pipeline, args, device: torch.device, weight_dtype: torch.dtype):
+    pipeline = unmerge_lora(
+        pipeline,
+        args.refinement_lora_path,
+        args.refinement_lora_alpha,
+        device=device,
+        dtype=weight_dtype,
+        sub_transformer_name="transformer",
+    )
+    if args.lora_path:
+        pipeline = merge_lora(
+            pipeline,
+            args.lora_path,
+            args.lora_alpha,
+            device=device,
+            dtype=weight_dtype,
+            transformer_only=True,
+        )
+    return pipeline
+
+
+def _save_two_stage_singleturn_result(
+    *,
+    output_dir: str,
+    stem: str,
+    coarse_generation: dict,
+    refined_generation: Optional[dict],
+    metadata: dict,
+    fps: int,
+):
+    if refined_generation is None:
+        output_paths = _save_singleturn_variant(
+            output_dir=output_dir,
+            stem=stem,
+            generation=coarse_generation,
+            fps=fps,
+        )
+        metadata_path = _write_singleturn_metadata(
+            output_dir=output_dir,
+            stem=stem,
+            metadata={**metadata, "outputs": output_paths},
+        )
+        return output_paths, None, metadata_path
+
+    coarse_output_paths = _save_singleturn_variant(
+        output_dir=output_dir,
+        stem=f"{stem}_coarse",
+        generation=coarse_generation,
+        fps=fps,
+    )
+    refined_output_paths = _save_singleturn_variant(
+        output_dir=output_dir,
+        stem=f"{stem}_refined",
+        generation=refined_generation,
+        fps=fps,
+    )
+    metadata_path = _write_singleturn_metadata(
+        output_dir=output_dir,
+        stem=stem,
+        metadata={
+            **metadata,
+            "outputs": coarse_output_paths,
+            "coarse_outputs": coarse_output_paths,
+            "refined_outputs": refined_output_paths,
+        },
+    )
+    return coarse_output_paths, refined_output_paths, metadata_path
 
 
 def _tensor_image_to_pil(tensor: torch.Tensor) -> Image.Image:
@@ -222,8 +340,9 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
         dtype=weight_dtype,
     )
 
+    prompt_cache = _encode_fixed_prompt(pipeline.tokenizer, pipeline.text_encoder, pipeline._execution_device, weight_dtype)
     with torch.no_grad():
-        generation = generate_singleturn_sample(
+        coarse_generation = generate_singleturn_sample(
             pipeline=pipeline,
             mask_frame_tensor=mask_frame_tensor,
             source_tensor=source_tensor,
@@ -233,6 +352,21 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             generator=generator,
             weight_dtype=weight_dtype,
         )
+        refined_generation = None
+        if args.enable_refinement:
+            pipeline = _enable_refinement_lora(pipeline, args, pipeline._execution_device, weight_dtype)
+            try:
+                refined_generation = refine_singleturn_sample_from_latents(
+                    pipeline=pipeline,
+                    coarse_latents=coarse_generation["latents"],
+                    prompt_embeds=prompt_cache["prompt_embeds"],
+                    prompt_seq_len=prompt_cache["prompt_seq_len"],
+                    negative_prompt=args.negative_prompt,
+                    guidance_scale=args.guidance_scale,
+                    weight_dtype=weight_dtype,
+                )
+            finally:
+                pipeline = _restore_coarse_lora(pipeline, args, pipeline._execution_device, weight_dtype)
 
     output_name = args.output_name or Path(args.image_path).stem
     preview_paths = _save_singleturn_input_visuals(
@@ -242,10 +376,11 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
         mask_path=args.mask_path,
         sample_size=args.sample_size,
     )
-    output_paths, metadata_path = _save_singleturn_result(
+    coarse_output_paths, refined_output_paths, metadata_path = _save_two_stage_singleturn_result(
         output_dir=args.output_dir,
         stem=output_name,
-        generation=generation,
+        coarse_generation=coarse_generation,
+        refined_generation=refined_generation,
         metadata={
             "mode": "image",
             "image_path": args.image_path,
@@ -257,11 +392,20 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             "guidance_scale": args.guidance_scale,
             "sample_size": list(args.sample_size),
             "input_previews": preview_paths,
+            "coarse_lora_path": args.lora_path or "",
+            "coarse_lora_alpha": args.lora_alpha,
+            "refinement_enabled": bool(args.enable_refinement),
+            "refinement_lora_path": args.refinement_lora_path or "",
+            "refinement_lora_alpha": args.refinement_lora_alpha,
         },
         fps=args.fps,
     )
 
-    return {"outputs": output_paths, "metadata": metadata_path}
+    return {
+        "outputs": coarse_output_paths,
+        "refined_outputs": refined_output_paths,
+        "metadata": metadata_path,
+    }
 
 
 def _run_singleturn_cached_sample(
@@ -280,7 +424,7 @@ def _run_singleturn_cached_sample(
         mask_frame_path = sample.get("mask_check_image", "")
 
     with torch.no_grad():
-        generation = generate_singleturn_sample_from_latents(
+        coarse_generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
             mask_frame_latent=sample["mask_frame_latent"],
             source_frame_latent=sample["source_frame_latent"],
@@ -292,6 +436,21 @@ def _run_singleturn_cached_sample(
             generator=generator,
             weight_dtype=weight_dtype,
         )
+        refined_generation = None
+        if args.enable_refinement:
+            pipeline = _enable_refinement_lora(pipeline, args, pipeline._execution_device, weight_dtype)
+            try:
+                refined_generation = refine_singleturn_sample_from_latents(
+                    pipeline=pipeline,
+                    coarse_latents=coarse_generation["latents"],
+                    prompt_embeds=prompt_cache["prompt_embeds"],
+                    prompt_seq_len=prompt_cache["prompt_seq_len"],
+                    negative_prompt=args.negative_prompt,
+                    guidance_scale=args.guidance_scale,
+                    weight_dtype=weight_dtype,
+                )
+            finally:
+                pipeline = _restore_coarse_lora(pipeline, args, pipeline._execution_device, weight_dtype)
 
     preview_paths = {}
     if sample.get("source_image") and mask_frame_path:
@@ -303,10 +462,11 @@ def _run_singleturn_cached_sample(
             sample_size=args.sample_size,
         )
 
-    output_paths, metadata_path = _save_singleturn_result(
+    coarse_output_paths, refined_output_paths, metadata_path = _save_two_stage_singleturn_result(
         output_dir=output_dir,
         stem=stem,
-        generation=generation,
+        coarse_generation=coarse_generation,
+        refined_generation=refined_generation,
         metadata={
             "mode": "cache",
             "cache_path": sample.get("cache_path", ""),
@@ -322,12 +482,18 @@ def _run_singleturn_cached_sample(
             "guidance_scale": args.guidance_scale,
             "mask_frame_image": mask_frame_path,
             "input_previews": preview_paths,
+            "coarse_lora_path": args.lora_path or "",
+            "coarse_lora_alpha": args.lora_alpha,
+            "refinement_enabled": bool(args.enable_refinement),
+            "refinement_lora_path": args.refinement_lora_path or "",
+            "refinement_lora_alpha": args.refinement_lora_alpha,
         },
         fps=args.fps,
     )
 
     return {
-        "output_paths": output_paths,
+        "output_paths": coarse_output_paths,
+        "refined_output_paths": refined_output_paths,
         "metadata": metadata_path,
         "sample_output_dir": output_dir,
         "stem": stem,
@@ -500,6 +666,9 @@ def parse_args():
     parser.add_argument("--config_path", type=str, default="config/wan2.1/wan_civitai.yaml", help="Wan config path.")
     parser.add_argument("--lora_path", type=str, default=None, help="Optional LoRA checkpoint.")
     parser.add_argument("--lora_alpha", type=float, default=1.0, help="LoRA merge multiplier.")
+    parser.add_argument("--enable_refinement", action="store_true", help="Run a one-step refinement pass after the coarse 50-step denoise.")
+    parser.add_argument("--refinement_lora_path", type=str, default=None, help="LoRA checkpoint used only for the refinement pass.")
+    parser.add_argument("--refinement_lora_alpha", type=float, default=1.0, help="Refinement LoRA merge multiplier.")
     parser.add_argument("--negative_prompt", type=str, default="", help="Optional negative prompt.")
     parser.add_argument("--guidance_scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of denoising steps.")
@@ -531,6 +700,11 @@ def parse_args():
             raise ValueError("--cached_num_workers must be non-negative.")
         if args.cached_prefetch_factor <= 0:
             raise ValueError("--cached_prefetch_factor must be positive.")
+
+    if args.enable_refinement and not args.refinement_lora_path:
+        raise ValueError("--enable_refinement requires --refinement_lora_path.")
+    if (not args.enable_refinement) and args.refinement_lora_path is not None:
+        raise ValueError("--refinement_lora_path requires --enable_refinement.")
 
     args.sample_size = normalize_singleturn_sample_size(args.sample_size)
     if any(dim % 16 != 0 for dim in args.sample_size):
