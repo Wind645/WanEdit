@@ -2164,6 +2164,7 @@ def main():
             with accelerator.accumulate(transformer3d):
                 batch_texts = None
                 singleturn_loss_mask = None
+                singleturn_supervised_start_frames = None
                 singleturn_refine_target_latents = None
                 singleturn_refine_loss_weight_map = None
                 if use_cached_data:
@@ -2485,7 +2486,76 @@ def main():
                 else:
                     sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                     if args.singleturn_mode:
-                        noisy_latents, target, singleturn_loss_mask = prepare_singleturn_noisy_latents(latents, noise, sigmas)
+                        use_dynamic_singleturn_tail_start = False
+                        if latents.shape[2] == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES:
+                            if use_cached_data:
+                                batch_total_frames = batch.get("total_frames")
+                                batch_cache_modes = batch.get("cache_mode")
+                                if isinstance(batch_total_frames, torch.Tensor):
+                                    total_frames_match = bool(
+                                        (batch_total_frames == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES).all().item()
+                                    )
+                                else:
+                                    total_frames_values = (
+                                        [int(value) for value in batch_total_frames]
+                                        if isinstance(batch_total_frames, (list, tuple))
+                                        else [int(batch_total_frames)]
+                                    )
+                                    total_frames_match = all(
+                                        value == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES for value in total_frames_values
+                                    )
+                                cache_modes = (
+                                    list(batch_cache_modes)
+                                    if isinstance(batch_cache_modes, (list, tuple))
+                                    else [batch_cache_modes]
+                                )
+                                cache_mode_match = all(
+                                    cache_mode == "singleturn_object_removal_v3_tail_interp11" for cache_mode in cache_modes
+                                )
+                                use_dynamic_singleturn_tail_start = total_frames_match and cache_mode_match
+                            else:
+                                use_dynamic_singleturn_tail_start = True
+
+                        if use_dynamic_singleturn_tail_start:
+                            singleturn_supervised_start_frames = torch.randint(
+                                3,
+                                SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES + 1,
+                                (latents.shape[0],),
+                                device=latents.device,
+                            )
+                        noisy_latents, target, singleturn_loss_mask = prepare_singleturn_noisy_latents(
+                            latents,
+                            noise,
+                            sigmas,
+                            supervised_start_frames=singleturn_supervised_start_frames,
+                        )
+                        if (
+                            singleturn_supervised_start_frames is not None
+                            and args.debug_shapes
+                            and accelerator.is_local_main_process
+                        ):
+                            should_log = (
+                                (global_step == 0 and step < 2)
+                                or (global_step > 0 and (global_step % args.debug_log_interval == 0))
+                            )
+                            if should_log:
+                                sampled_start_frames = singleturn_supervised_start_frames.detach().cpu()
+                                sampled_hist_frames, sampled_hist_counts = torch.unique(
+                                    sampled_start_frames,
+                                    return_counts=True,
+                                )
+                                hist_payload = {
+                                    int(frame): int(count)
+                                    for frame, count in zip(sampled_hist_frames.tolist(), sampled_hist_counts.tolist())
+                                }
+                                supervised_frame_counts = (
+                                    SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES - sampled_start_frames + 1
+                                ).tolist()
+                                print(
+                                    "[DEBUG] singleturn supervised_start_frames="
+                                    f"{sampled_start_frames.tolist()} supervised_frame_counts={supervised_frame_counts} "
+                                    f"hist={hist_payload}"
+                                )
                     else:
                         noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 

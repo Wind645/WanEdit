@@ -394,6 +394,73 @@ def build_singleturn_loss_mask_like(
     return mask
 
 
+def _normalize_singleturn_supervised_start_frames(
+    supervised_start_frames: torch.Tensor | Sequence[int],
+    *,
+    batch_size: int,
+    total_frames: int,
+    device: torch.device,
+) -> torch.Tensor:
+    start_frames = torch.as_tensor(supervised_start_frames, device=device)
+    if start_frames.ndim == 0:
+        start_frames = start_frames.repeat(batch_size)
+    if start_frames.ndim != 1 or start_frames.shape[0] != batch_size:
+        raise ValueError(
+            "supervised_start_frames must provide one frame index per batch item, "
+            f"got shape {tuple(start_frames.shape)} for batch_size={batch_size}."
+        )
+    start_frames = start_frames.to(dtype=torch.long)
+    if ((start_frames < 1) | (start_frames > total_frames)).any():
+        raise ValueError(
+            f"supervised_start_frames must lie in [1, {total_frames}], got {start_frames.tolist()}."
+        )
+    return start_frames
+
+
+def build_singleturn_loss_mask_from_start_frames(
+    latents: torch.Tensor,
+    supervised_start_frames: torch.Tensor | Sequence[int],
+) -> torch.Tensor:
+    if latents.ndim != 5:
+        raise ValueError(f"latents must have shape (B, C, T, H, W), got {tuple(latents.shape)}")
+
+    batch_size, channels, total_frames, height, width = latents.shape
+    start_frames = _normalize_singleturn_supervised_start_frames(
+        supervised_start_frames,
+        batch_size=batch_size,
+        total_frames=total_frames,
+        device=latents.device,
+    )
+    frame_numbers = torch.arange(1, total_frames + 1, device=latents.device, dtype=torch.long).view(1, 1, total_frames, 1, 1)
+    mask = frame_numbers >= start_frames.view(batch_size, 1, 1, 1, 1)
+    return mask.expand(batch_size, channels, total_frames, height, width).to(dtype=latents.dtype)
+
+
+def restore_singleturn_clean_prefix_from_start_frames(
+    updated_latents: torch.Tensor,
+    clean_latents: torch.Tensor,
+    supervised_start_frames: torch.Tensor | Sequence[int],
+) -> torch.Tensor:
+    if updated_latents.shape != clean_latents.shape:
+        raise ValueError(
+            f"updated_latents and clean_latents must share the same shape, got "
+            f"{tuple(updated_latents.shape)} and {tuple(clean_latents.shape)}"
+        )
+    if updated_latents.ndim != 5:
+        raise ValueError(f"updated_latents must have shape (B, C, T, H, W), got {tuple(updated_latents.shape)}")
+
+    batch_size, _, total_frames, _, _ = updated_latents.shape
+    start_frames = _normalize_singleturn_supervised_start_frames(
+        supervised_start_frames,
+        batch_size=batch_size,
+        total_frames=total_frames,
+        device=updated_latents.device,
+    )
+    frame_numbers = torch.arange(1, total_frames + 1, device=updated_latents.device, dtype=torch.long).view(1, 1, total_frames, 1, 1)
+    clean_prefix_mask = frame_numbers < start_frames.view(batch_size, 1, 1, 1, 1)
+    return torch.where(clean_prefix_mask, clean_latents, updated_latents)
+
+
 def build_singleturn_refinement_target_latents(
     coarse_latents: torch.Tensor,
     gt_last_latent: torch.Tensor,
@@ -478,16 +545,27 @@ def prepare_singleturn_noisy_latents(
     sigmas: torch.Tensor,
     *,
     prefix_frames: int = SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
+    supervised_start_frames: Optional[torch.Tensor | Sequence[int]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if latents.shape != noise.shape:
         raise ValueError(f"latents and noise must share the same shape, got {tuple(latents.shape)} and {tuple(noise.shape)}")
     if latents.ndim != 5:
         raise ValueError(f"latents must have shape (B, C, T, H, W), got {tuple(latents.shape)}")
+    if supervised_start_frames is not None and prefix_frames != SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES:
+        raise ValueError("Provide either prefix_frames or supervised_start_frames, not both.")
 
     noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
-    noisy_latents[:, :, :prefix_frames] = latents[:, :, :prefix_frames]
     target = noise - latents
-    loss_mask = build_singleturn_loss_mask_like(latents, prefix_frames=prefix_frames)
+    if supervised_start_frames is None:
+        noisy_latents[:, :, :prefix_frames] = latents[:, :, :prefix_frames]
+        loss_mask = build_singleturn_loss_mask_like(latents, prefix_frames=prefix_frames)
+    else:
+        noisy_latents = restore_singleturn_clean_prefix_from_start_frames(
+            noisy_latents,
+            latents,
+            supervised_start_frames,
+        )
+        loss_mask = build_singleturn_loss_mask_from_start_frames(latents, supervised_start_frames)
     return noisy_latents, target, loss_mask
 
 
