@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
+    is_supported_singleturn_object_removal_mode,
     normalize_singleturn_sample_size,
     preprocess_singleturn_image,
     preprocess_singleturn_mask_frame,
@@ -337,7 +338,7 @@ class CachedSingleTurnLatentDataset(Dataset):
         self,
         manifest_path: str,
         data_root: Optional[str] = None,
-        expected_mode: str = "singleturn_object_removal_v2",
+        expected_mode: str = "singleturn_object_removal_cached",
     ):
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
@@ -381,7 +382,11 @@ class CachedSingleTurnLatentDataset(Dataset):
             )
 
         payload_mode = payload.get("mode")
-        if payload_mode != self.expected_mode:
+        if self.expected_mode == "singleturn_object_removal_cached":
+            mode_matches = is_supported_singleturn_object_removal_mode(payload_mode)
+        else:
+            mode_matches = payload_mode == self.expected_mode
+        if not mode_matches:
             raise ValueError(
                 f"Cached SingleTurn sample {cache_path} has unsupported mode={payload_mode!r}. "
                 f"Expected mode={self.expected_mode!r}."
@@ -421,7 +426,7 @@ class CachedSingleTurnLatentDataset(Dataset):
             "data_type": "image",
             "idx": index,
         }
-        if self.expected_mode == "singleturn_object_removal_v2":
+        if self.expected_mode == "singleturn_object_removal_cached" or is_supported_singleturn_object_removal_mode(self.expected_mode):
             missing = [
                 key
                 for key in ("full_latents", "mask_frame_latent", "source_frame_latent", "edge_weight_map")
@@ -429,10 +434,11 @@ class CachedSingleTurnLatentDataset(Dataset):
             ]
             if missing:
                 raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}")
-            if payload["full_latents"].shape[-3] != SINGLETURN_TOTAL_FRAMES:
+            total_frames = int(payload.get("total_frames", payload["full_latents"].shape[-3]))
+            if payload["full_latents"].shape[-3] != total_frames:
                 raise ValueError(
                     f"Cached SingleTurn sample {cache_path} has {payload['full_latents'].shape[-3]} frames; "
-                    f"expected {SINGLETURN_TOTAL_FRAMES}."
+                    f"expected {total_frames}."
                 )
             sample.update(
                 {
@@ -440,12 +446,14 @@ class CachedSingleTurnLatentDataset(Dataset):
                     "mask_frame_latent": payload["mask_frame_latent"],
                     "source_frame_latent": payload["source_frame_latent"],
                     "edge_weight_map": payload["edge_weight_map"],
+                    "total_frames": total_frames,
+                    "cache_mode": payload_mode,
                 }
             )
             return sample
 
         if self.expected_mode == "singleturn_object_removal_refine_v1":
-            missing = [key for key in ("input_latents", "target_latents") if key not in payload]
+            missing = [key for key in ("input_latents", "target_latents", "refinement_loss_weight_map") if key not in payload]
             if missing:
                 raise ValueError(f"Cached SingleTurn refine sample {cache_path} is missing keys: {missing}")
             if payload["input_latents"].shape[-3] != SINGLETURN_TOTAL_FRAMES:
@@ -462,6 +470,7 @@ class CachedSingleTurnLatentDataset(Dataset):
                 {
                     "input_latents": payload["input_latents"],
                     "target_latents": payload["target_latents"],
+                    "refinement_loss_weight_map": payload["refinement_loss_weight_map"],
                     "coarse_output_dir": entry.get("coarse_output_dir", payload.get("coarse_output_dir", "")),
                     "coarse_meta_path": entry.get("coarse_meta_path", payload.get("coarse_meta_path", "")),
                 }

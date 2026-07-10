@@ -31,8 +31,11 @@ from videox_fun.pipeline import WanPipeline
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
+    SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+    SINGLETURN_TOTAL_FRAMES,
     generate_singleturn_sample,
     generate_singleturn_sample_from_latents,
+    is_supported_singleturn_object_removal_mode,
     normalize_singleturn_sample_size,
     preprocess_singleturn_image,
     preprocess_singleturn_mask_frame,
@@ -351,9 +354,15 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             num_inference_steps=args.num_inference_steps,
             generator=generator,
             weight_dtype=weight_dtype,
+            total_frames=args.singleturn_total_frames,
         )
         refined_generation = None
         if args.enable_refinement:
+            if args.singleturn_total_frames != SINGLETURN_TOTAL_FRAMES:
+                raise ValueError(
+                    "The current refinement stage only supports 8-frame coarse latents. "
+                    f"Got singleturn_total_frames={args.singleturn_total_frames}."
+                )
             pipeline = _enable_refinement_lora(pipeline, args, pipeline._execution_device, weight_dtype)
             try:
                 refined_generation = refine_singleturn_sample_from_latents(
@@ -362,7 +371,7 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
                     prompt_embeds=prompt_cache["prompt_embeds"],
                     prompt_seq_len=prompt_cache["prompt_seq_len"],
                     negative_prompt=args.negative_prompt,
-                    guidance_scale=args.guidance_scale,
+                    guidance_scale=args.refinement_guidance_scale,
                     weight_dtype=weight_dtype,
                 )
             finally:
@@ -391,12 +400,14 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "sample_size": list(args.sample_size),
+            "singleturn_total_frames": args.singleturn_total_frames,
             "input_previews": preview_paths,
             "coarse_lora_path": args.lora_path or "",
             "coarse_lora_alpha": args.lora_alpha,
             "refinement_enabled": bool(args.enable_refinement),
             "refinement_lora_path": args.refinement_lora_path or "",
             "refinement_lora_alpha": args.refinement_lora_alpha,
+            "refinement_guidance_scale": args.refinement_guidance_scale,
         },
         fps=args.fps,
     )
@@ -424,6 +435,7 @@ def _run_singleturn_cached_sample(
         mask_frame_path = sample.get("mask_check_image", "")
 
     with torch.no_grad():
+        total_frames = int(sample.get("total_frames", SINGLETURN_TOTAL_FRAMES))
         coarse_generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
             mask_frame_latent=sample["mask_frame_latent"],
@@ -435,9 +447,15 @@ def _run_singleturn_cached_sample(
             num_inference_steps=args.num_inference_steps,
             generator=generator,
             weight_dtype=weight_dtype,
+            total_frames=total_frames,
         )
         refined_generation = None
         if args.enable_refinement:
+            if total_frames != SINGLETURN_TOTAL_FRAMES:
+                raise ValueError(
+                    "The current refinement stage only supports 8-frame coarse cached samples. "
+                    f"Got total_frames={total_frames} for cache_path={sample.get('cache_path', '')}."
+                )
             pipeline = _enable_refinement_lora(pipeline, args, pipeline._execution_device, weight_dtype)
             try:
                 refined_generation = refine_singleturn_sample_from_latents(
@@ -446,7 +464,7 @@ def _run_singleturn_cached_sample(
                     prompt_embeds=prompt_cache["prompt_embeds"],
                     prompt_seq_len=prompt_cache["prompt_seq_len"],
                     negative_prompt=args.negative_prompt,
-                    guidance_scale=args.guidance_scale,
+                    guidance_scale=args.refinement_guidance_scale,
                     weight_dtype=weight_dtype,
                 )
             finally:
@@ -480,6 +498,8 @@ def _run_singleturn_cached_sample(
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
+            "singleturn_total_frames": total_frames,
+            "cache_mode": sample.get("cache_mode", ""),
             "mask_frame_image": mask_frame_path,
             "input_previews": preview_paths,
             "coarse_lora_path": args.lora_path or "",
@@ -487,6 +507,7 @@ def _run_singleturn_cached_sample(
             "refinement_enabled": bool(args.enable_refinement),
             "refinement_lora_path": args.refinement_lora_path or "",
             "refinement_lora_alpha": args.refinement_lora_alpha,
+            "refinement_guidance_scale": args.refinement_guidance_scale,
         },
         fps=args.fps,
     )
@@ -521,10 +542,10 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 f"Cached SingleTurn sample {cache_path} uses the deprecated instructpix2pix posterior payload. "
                 "Re-run CORNE object-removal preprocess."
             )
-        if payload.get("mode") != "singleturn_object_removal_v2":
+        if not is_supported_singleturn_object_removal_mode(payload.get("mode")):
             raise ValueError(
                 f"Cached SingleTurn sample {cache_path} has unsupported mode={payload.get('mode')!r}. "
-                "Re-run CORNE object-removal preprocess for the 8-frame two-prefix cache."
+                "Re-run CORNE object-removal preprocess / patch to generate a supported cache."
             )
         missing = [key for key in ("mask_frame_latent", "source_frame_latent") if key not in payload]
         if missing:
@@ -544,6 +565,8 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             "mask_frame_image": payload.get("mask_frame_image", ""),
             "mask_sam_image": payload.get("mask_sam_image", ""),
             "used_mask_sam": bool(payload.get("used_mask_sam", False)),
+            "total_frames": int(payload.get("total_frames", payload.get("full_latents", torch.empty(0, 0)).shape[1] if "full_latents" in payload else SINGLETURN_TOTAL_FRAMES)),
+            "cache_mode": payload.get("mode", ""),
             "idx": 0,
         }
         output_name = args.output_name or Path(cache_path).stem
@@ -622,6 +645,8 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 "mask_frame_image": _first_item(batch["mask_frame_image"]),
                 "mask_sam_image": _first_item(batch["mask_sam_image"]),
                 "used_mask_sam": bool(_first_item(batch["used_mask_sam"])),
+                "total_frames": int(_first_item(batch["total_frames"])),
+                "cache_mode": _first_item(batch["cache_mode"]),
                 "idx": batch_index,
             }
 
@@ -669,6 +694,7 @@ def parse_args():
     parser.add_argument("--enable_refinement", action="store_true", help="Run a one-step refinement pass after the coarse 50-step denoise.")
     parser.add_argument("--refinement_lora_path", type=str, default=None, help="LoRA checkpoint used only for the refinement pass.")
     parser.add_argument("--refinement_lora_alpha", type=float, default=1.0, help="Refinement LoRA merge multiplier.")
+    parser.add_argument("--refinement_guidance_scale", type=float, default=1.0, help="Guidance scale used only during the one-step refinement pass.")
     parser.add_argument("--negative_prompt", type=str, default="", help="Optional negative prompt.")
     parser.add_argument("--guidance_scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of denoising steps.")
@@ -682,6 +708,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--fps", type=int, default=4, help="GIF playback FPS.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Inference weight dtype.")
+    parser.add_argument(
+        "--singleturn_total_frames",
+        type=int,
+        default=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+        help="Total latent frames used in direct image-mode SingleTurn inference. Cached mode ignores this and follows the cache payload.",
+    )
     args = parser.parse_args()
 
     cache_mode = args.cached_sample_path is not None or args.cached_data_meta is not None
@@ -705,6 +737,8 @@ def parse_args():
         raise ValueError("--enable_refinement requires --refinement_lora_path.")
     if (not args.enable_refinement) and args.refinement_lora_path is not None:
         raise ValueError("--refinement_lora_path requires --enable_refinement.")
+    if args.singleturn_total_frames < 8:
+        raise ValueError(f"--singleturn_total_frames must be >= 8, got {args.singleturn_total_frames}.")
 
     args.sample_size = normalize_singleturn_sample_size(args.sample_size)
     if any(dim % 16 != 0 for dim in args.sample_size):

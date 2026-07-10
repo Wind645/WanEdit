@@ -25,11 +25,14 @@ for project_root in project_roots:
 from videox_fun.data.singleturn_dataset import load_singleturn_cache_payload
 from videox_fun.models import AutoencoderKLWan
 from videox_fun.utils.singleturn_utils import (
+    build_singleturn_refinement_weight_map,
     CORNE_SINGLETURN_PROMPT,
     SINGLETURN_TOTAL_FRAMES,
     build_singleturn_refinement_target_latents,
     normalize_singleturn_sample_size,
     preprocess_singleturn_image,
+    preprocess_singleturn_mask,
+    resize_singleturn_mask_to_latent_grid,
 )
 
 
@@ -239,6 +242,14 @@ def main():
         )
         gt_last_latent = source_payload["full_latents"][:, -1:].unsqueeze(0).to(device=device, dtype=weight_dtype)
         target_latents = build_singleturn_refinement_target_latents(coarse_latents, gt_last_latent)
+        mask_check_tensor = preprocess_singleturn_mask(
+            source_payload["mask_check_image"],
+            sample_size,
+            add_batch_dim=True,
+            add_frame_dim=True,
+        ).to(device=device, dtype=weight_dtype)
+        mask_check_latent = resize_singleturn_mask_to_latent_grid(mask_check_tensor, coarse_latents[:, :, :1])
+        refinement_loss_weight_map = build_singleturn_refinement_weight_map(mask_check_latent)
 
         prompt_cache_source = _resolve_shared_prompt_source(cache_path, source_payload)
         shared_prompt_cache = _copy_shared_prompt_cache_if_needed(output_dir, prompt_cache_source)
@@ -250,6 +261,7 @@ def main():
             "dataset_type": "corne_object_removal_refine",
             "input_latents": coarse_latents[0].detach().cpu().to(weight_dtype),
             "target_latents": target_latents[0].detach().cpu().to(weight_dtype),
+            "refinement_loss_weight_map": refinement_loss_weight_map[0].detach().cpu().to(weight_dtype),
             "coarse_output_dir": str(meta_path.parent.resolve()),
             "coarse_meta_path": str(meta_path.resolve()),
             "coarse_full_gif": str(full_gif_path.resolve()),

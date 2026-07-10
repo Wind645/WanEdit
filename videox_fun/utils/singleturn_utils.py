@@ -12,6 +12,11 @@ from videox_fun.utils.utils import save_videos_grid
 
 CORNE_SINGLETURN_PROMPT = "Remove the masked object and its side effect"
 SINGLETURN_TOTAL_FRAMES = 8
+SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES = 11
+SINGLETURN_OBJECT_REMOVAL_MODE_TO_TOTAL_FRAMES = {
+    "singleturn_object_removal_v2": 8,
+    "singleturn_object_removal_v3_tail_interp11": 11,
+}
 SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 2
 SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES = 5
 SINGLETURN_TAIL_START = 2
@@ -220,6 +225,25 @@ def _interp(start: torch.Tensor, end: torch.Tensor, alpha: float) -> torch.Tenso
     return (1.0 - alpha) * start + alpha * end
 
 
+def get_singleturn_object_removal_total_frames_for_mode(
+    mode: Optional[str],
+    *,
+    fallback: Optional[int] = None,
+) -> int:
+    if mode in SINGLETURN_OBJECT_REMOVAL_MODE_TO_TOTAL_FRAMES:
+        return SINGLETURN_OBJECT_REMOVAL_MODE_TO_TOTAL_FRAMES[mode]
+    if fallback is not None:
+        return int(fallback)
+    raise ValueError(
+        f"Unsupported SingleTurn object-removal mode {mode!r}. "
+        f"Supported modes: {sorted(SINGLETURN_OBJECT_REMOVAL_MODE_TO_TOTAL_FRAMES)}"
+    )
+
+
+def is_supported_singleturn_object_removal_mode(mode: Optional[str]) -> bool:
+    return mode in SINGLETURN_OBJECT_REMOVAL_MODE_TO_TOTAL_FRAMES
+
+
 def resize_singleturn_mask_to_latent_grid(mask: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
     if mask.ndim == 5:
         if mask.shape[2] != 1:
@@ -245,6 +269,8 @@ def build_singleturn_object_removal_latents(
     bg_latent: torch.Tensor,
     mask_check_latent: torch.Tensor,
     noise_latent: Optional[torch.Tensor] = None,
+    *,
+    total_frames: int = SINGLETURN_TOTAL_FRAMES,
 ) -> torch.Tensor:
     _ensure_singleturn_latent_shape("mask_frame_latent", mask_frame_latent)
     _ensure_singleturn_latent_shape("source_frame_latent", source_frame_latent)
@@ -272,16 +298,18 @@ def build_singleturn_object_removal_latents(
     mask = mask_check_latent.to(dtype=torch.bool).expand_as(source_frame_latent)
     noisy_anchor = torch.where(mask, noise_latent, source_frame_latent)
 
+    if total_frames < 8:
+        raise ValueError(f"total_frames must be >= 8 for SingleTurn object removal, got {total_frames}")
+    tail_interp_steps = total_frames - 5
     frames = [
         mask_frame_latent,
         source_frame_latent,
         _interp(source_frame_latent, noisy_anchor, 1.0 / 3.0),
         _interp(source_frame_latent, noisy_anchor, 2.0 / 3.0),
         noisy_anchor,
-        _interp(noisy_anchor, bg_latent, 1.0 / 3.0),
-        _interp(noisy_anchor, bg_latent, 2.0 / 3.0),
-        bg_latent,
     ]
+    for step_idx in range(1, tail_interp_steps + 1):
+        frames.append(_interp(noisy_anchor, bg_latent, float(step_idx) / float(tail_interp_steps)))
     return torch.cat(frames, dim=2)
 
 
@@ -328,16 +356,19 @@ def build_singleturn_prefix_inference_latents(
     mask_frame_latent: torch.Tensor,
     source_frame_latent: torch.Tensor,
     tail_noise: torch.Tensor,
+    *,
+    total_frames: int = SINGLETURN_TOTAL_FRAMES,
 ) -> torch.Tensor:
     _ensure_singleturn_latent_shape("mask_frame_latent", mask_frame_latent)
     _ensure_singleturn_latent_shape("source_frame_latent", source_frame_latent)
     _ensure_matching_shapes(source_frame_latent, mask_frame_latent, "mask_frame_latent")
     if tail_noise.ndim != 5:
         raise ValueError(f"tail_noise must have shape (B, C, T, H, W), got {tuple(tail_noise.shape)}")
-    if tail_noise.shape[2] != SINGLETURN_TOTAL_FRAMES - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES:
+    expected_tail_frames = total_frames - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES
+    if tail_noise.shape[2] != expected_tail_frames:
         raise ValueError(
             "tail_noise must contain exactly "
-            f"{SINGLETURN_TOTAL_FRAMES - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES} latent frames, "
+            f"{expected_tail_frames} latent frames, "
             f"got {tail_noise.shape[2]}"
         )
     if source_frame_latent.shape[:2] + source_frame_latent.shape[3:] != tail_noise.shape[:2] + tail_noise.shape[3:]:
@@ -353,15 +384,11 @@ def build_singleturn_loss_mask_like(
     *,
     prefix_frames: int = SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
 ) -> torch.Tensor:
-    if latents.ndim != 5 or latents.shape[2] != SINGLETURN_TOTAL_FRAMES:
-        raise ValueError(f"latents must have shape (B, C, {SINGLETURN_TOTAL_FRAMES}, H, W), got {tuple(latents.shape)}")
-    if prefix_frames <= 0 or prefix_frames >= SINGLETURN_TOTAL_FRAMES:
-        raise ValueError(f"prefix_frames must be in [1, {SINGLETURN_TOTAL_FRAMES - 1}], got {prefix_frames}")
-    if prefix_frames + 3 != SINGLETURN_TOTAL_FRAMES:
-        raise ValueError(
-            "SingleTurn refinement target construction expects exactly three editable tail frames "
-            f"(F6/F7/F8), got prefix_frames={prefix_frames} for total_frames={SINGLETURN_TOTAL_FRAMES}."
-        )
+    if latents.ndim != 5:
+        raise ValueError(f"latents must have shape (B, C, T, H, W), got {tuple(latents.shape)}")
+    total_frames = latents.shape[2]
+    if prefix_frames <= 0 or prefix_frames >= total_frames:
+        raise ValueError(f"prefix_frames must be in [1, {total_frames - 1}], got {prefix_frames}")
     mask = torch.ones_like(latents)
     mask[:, :, :prefix_frames] = 0
     return mask
@@ -399,6 +426,52 @@ def build_singleturn_refinement_target_latents(
     return target_latents
 
 
+def build_singleturn_refinement_weight_map(
+    mask_check_latent: torch.Tensor,
+    *,
+    total_frames: int = SINGLETURN_TOTAL_FRAMES,
+    prefix_frames: int = SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
+    background_weight: float = 0.1,
+    mask_weight: float = 3.0,
+    edge_weight: float = 5.0,
+    edge_radius: int = 2,
+) -> torch.Tensor:
+    if mask_check_latent.ndim != 5 or mask_check_latent.shape[1] != 1 or mask_check_latent.shape[2] != 1:
+        raise ValueError(
+            "mask_check_latent must have shape (B, 1, 1, H, W), "
+            f"got {tuple(mask_check_latent.shape)}"
+        )
+    if edge_radius < 1:
+        raise ValueError(f"edge_radius must be >= 1, got {edge_radius}")
+    if background_weight < 0.0:
+        raise ValueError(f"background_weight must be >= 0.0, got {background_weight}")
+    if edge_weight < mask_weight or mask_weight < background_weight:
+        raise ValueError(
+            "Expected edge_weight >= mask_weight >= background_weight, "
+            f"got edge_weight={edge_weight}, mask_weight={mask_weight}, background_weight={background_weight}"
+        )
+
+    mask_2d = (mask_check_latent[:, :, 0] >= 0.5).float()
+    dilated = F.max_pool2d(mask_2d, kernel_size=3, stride=1, padding=1)
+    eroded = -F.max_pool2d(-mask_2d, kernel_size=3, stride=1, padding=1)
+    boundary = (dilated - eroded > 0).float()
+
+    weights_2d = torch.full_like(mask_2d, background_weight)
+    weights_2d = torch.where(mask_2d > 0, torch.full_like(weights_2d, mask_weight), weights_2d)
+
+    expanded_boundary = boundary
+    for distance in range(1, edge_radius):
+        expanded_boundary = torch.maximum(
+            expanded_boundary,
+            F.max_pool2d(boundary, kernel_size=2 * distance + 1, stride=1, padding=distance),
+        )
+    weights_2d = torch.where(expanded_boundary > 0, torch.full_like(weights_2d, edge_weight), weights_2d)
+
+    weight_map = weights_2d.unsqueeze(2).repeat(1, 1, total_frames, 1, 1)
+    weight_map[:, :, :prefix_frames] = 0
+    return weight_map.to(dtype=mask_check_latent.dtype)
+
+
 def prepare_singleturn_noisy_latents(
     latents: torch.Tensor,
     noise: torch.Tensor,
@@ -408,8 +481,8 @@ def prepare_singleturn_noisy_latents(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if latents.shape != noise.shape:
         raise ValueError(f"latents and noise must share the same shape, got {tuple(latents.shape)} and {tuple(noise.shape)}")
-    if latents.ndim != 5 or latents.shape[2] != SINGLETURN_TOTAL_FRAMES:
-        raise ValueError(f"latents must have shape (B, C, {SINGLETURN_TOTAL_FRAMES}, H, W), got {tuple(latents.shape)}")
+    if latents.ndim != 5:
+        raise ValueError(f"latents must have shape (B, C, T, H, W), got {tuple(latents.shape)}")
 
     noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
     noisy_latents[:, :, :prefix_frames] = latents[:, :, :prefix_frames]
@@ -473,6 +546,7 @@ def _run_singleturn_generation(
     num_inference_steps: int = 50,
     generator: Optional[torch.Generator] = None,
     weight_dtype: Optional[torch.dtype] = None,
+    total_frames: int = SINGLETURN_TOTAL_FRAMES,
 ):
     device = pipeline._execution_device
     do_classifier_free_guidance = guidance_scale > 1.0
@@ -518,7 +592,7 @@ def _run_singleturn_generation(
         (
             source_frame_latent.shape[0],
             source_frame_latent.shape[1],
-            SINGLETURN_TOTAL_FRAMES - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
+            total_frames - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
             source_frame_latent.shape[3],
             source_frame_latent.shape[4],
         ),
@@ -526,7 +600,12 @@ def _run_singleturn_generation(
         generator=generator,
         dtype=weight_dtype,
     )
-    latents = build_singleturn_prefix_inference_latents(mask_frame_latent, source_frame_latent, tail_noise)
+    latents = build_singleturn_prefix_inference_latents(
+        mask_frame_latent,
+        source_frame_latent,
+        tail_noise,
+        total_frames=total_frames,
+    )
     seq_len = compute_wan_seq_len_from_latents(latents, pipeline.transformer.config.patch_size)
 
     def autocast_context():
@@ -584,6 +663,7 @@ def generate_singleturn_sample(
     generator: Optional[torch.Generator] = None,
     weight_dtype: Optional[torch.dtype] = None,
     max_sequence_length: int = 512,
+    total_frames: int = SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
 ):
     del prompt
     del prompt_template
@@ -608,6 +688,7 @@ def generate_singleturn_sample(
         num_inference_steps=num_inference_steps,
         generator=generator,
         weight_dtype=weight_dtype,
+        total_frames=total_frames,
     )
 
 
@@ -623,6 +704,7 @@ def generate_singleturn_sample_from_latents(
     generator: Optional[torch.Generator] = None,
     weight_dtype: Optional[torch.dtype] = None,
     max_sequence_length: int = 512,
+    total_frames: int = SINGLETURN_TOTAL_FRAMES,
 ):
     device = pipeline._execution_device
     weight_dtype = weight_dtype or getattr(pipeline.transformer, "dtype", torch.float32)
@@ -646,6 +728,7 @@ def generate_singleturn_sample_from_latents(
         num_inference_steps=num_inference_steps,
         generator=generator,
         weight_dtype=weight_dtype,
+        total_frames=total_frames,
     )
 
 

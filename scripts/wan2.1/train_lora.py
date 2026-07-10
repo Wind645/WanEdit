@@ -97,6 +97,7 @@ except ImportError:
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import create_network, merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
+                                               SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
                                                build_singleturn_object_removal_latents,
                                                build_singleturn_loss_mask_like,
                                                compute_wan_seq_len_from_latents,
@@ -195,9 +196,15 @@ def load_cached_singleturn_batch(batch, weight_dtype, device, refinement_mode=Fa
     prompt_seq_lens = batch["prompt_seq_len"].tolist()
     prompt_embeds = [embed[:seq_len] for embed, seq_len in zip(prompt_embeds_padded, prompt_seq_lens)]
     target_latents = None
+    refinement_loss_weight_map = None
     if refinement_mode:
         target_latents = batch["target_latents"].to(device=device, dtype=weight_dtype, non_blocking=True)
-    return full_latents, prompt_embeds, target_latents
+        refinement_loss_weight_map = batch["refinement_loss_weight_map"].to(
+            device=device,
+            dtype=weight_dtype,
+            non_blocking=True,
+        )
+    return full_latents, prompt_embeds, target_latents, refinement_loss_weight_map
 
 
 def load_singleturn_shared_prompt_cache(prompt_cache_path, weight_dtype, device):
@@ -397,6 +404,7 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                     num_inference_steps=args.singleturn_validation_num_inference_steps,
                     generator=generator,
                     weight_dtype=weight_dtype,
+                    total_frames=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
                 )
 
             output_paths = save_singleturn_outputs(
@@ -1662,7 +1670,7 @@ def main():
 
     if use_cached_data:
         if args.singleturn_mode:
-            expected_mode = "singleturn_object_removal_refine_v1" if args.singleturn_refine_mode else "singleturn_object_removal_v2"
+            expected_mode = "singleturn_object_removal_refine_v1" if args.singleturn_refine_mode else "singleturn_object_removal_cached"
             train_dataset = CachedSingleTurnLatentDataset(
                 args.cached_data_meta,
                 args.cached_data_dir,
@@ -2157,10 +2165,16 @@ def main():
                 batch_texts = None
                 singleturn_loss_mask = None
                 singleturn_refine_target_latents = None
+                singleturn_refine_loss_weight_map = None
                 if use_cached_data:
                     with torch.no_grad():
                         if args.singleturn_mode:
-                            latents, prompt_embeds, singleturn_refine_target_latents = load_cached_singleturn_batch(
+                            (
+                                latents,
+                                prompt_embeds,
+                                singleturn_refine_target_latents,
+                                singleturn_refine_loss_weight_map,
+                            ) = load_cached_singleturn_batch(
                                 batch=batch,
                                 weight_dtype=weight_dtype,
                                 device=accelerator.device,
@@ -2341,6 +2355,7 @@ def main():
                                 bg_latent=target_latents,
                                 mask_check_latent=latent_mask,
                                 noise_latent=noise_latents,
+                                total_frames=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
                             )
                         elif vae_stream_1 is not None:
                             vae_stream_1.wait_stream(torch.cuda.current_stream())
@@ -2467,10 +2482,6 @@ def main():
                 if args.singleturn_refine_mode:
                     noisy_latents = latents
                     target = singleturn_refine_target_latents - latents
-                    singleturn_loss_mask = build_singleturn_loss_mask_like(
-                        latents,
-                        prefix_frames=SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
-                    )
                 else:
                     sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                     if args.singleturn_mode:
@@ -2516,9 +2527,9 @@ def main():
                     return final_loss
                 
                 if args.singleturn_refine_mode:
-                    loss_mask = singleturn_loss_mask.float()
+                    loss_weights = singleturn_refine_loss_weight_map.float()
                     loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
-                    loss = (loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
+                    loss = (loss * loss_weights).sum() / loss_weights.sum().clamp_min(1.0)
                 else:
                     weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
                     # Check if video edit loss mode is enabled
