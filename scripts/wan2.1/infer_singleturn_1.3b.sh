@@ -4,6 +4,9 @@ set -euo pipefail
 export MODEL_NAME=${MODEL_NAME:-models/Wan2.1-T2V-1.3B}
 export IMAGE_PATH=${IMAGE_PATH:-}
 export MASK_PATH=${MASK_PATH:-}
+export RAW_SOURCE_DIR=${RAW_SOURCE_DIR:-}
+export RAW_MASK_DIR=${RAW_MASK_DIR:-}
+export RAW_GT_DIR=${RAW_GT_DIR:-}
 export PROMPT=${PROMPT:-}
 export CACHED_SAMPLE_PATH=${CACHED_SAMPLE_PATH:-}
 export CACHED_DATA_META=${CACHED_DATA_META:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix/manifest.json}
@@ -14,6 +17,7 @@ export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-}
 export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
 export OUTPUT_DIR=${OUTPUT_DIR:-outputs/singleturn_object_removal_v3_twoprefix}
+export VIDEO_FORMAT=${VIDEO_FORMAT:-gif}
 export LORA_PATH=${LORA_PATH:-}
 export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
 export REFINEMENT_LORA_PATH=${REFINEMENT_LORA_PATH:-}
@@ -36,13 +40,6 @@ elif [[ "${DTYPE}" == "fp32" ]]; then
   ACCELERATE_MIXED_PRECISION=no
 fi
 
-if [[ -z "${IMAGE_PATH}" ]]; then
-  if [[ -z "${CACHED_SAMPLE_PATH}" && -z "${CACHED_DATA_META}" ]]; then
-    echo "Set either IMAGE_PATH/MASK_PATH or CACHED_SAMPLE_PATH/CACHED_DATA_META." >&2
-    exit 1
-  fi
-fi
-
 cmd_base=(
   scripts/wan2.1/singleturn_edit_infer.py
   --pretrained_model_name_or_path "$MODEL_NAME"
@@ -53,6 +50,7 @@ cmd_base=(
   --seed "$SEED"
   --fps "$FPS"
   --dtype "$DTYPE"
+  --video_format "$VIDEO_FORMAT"
 )
 
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
@@ -72,11 +70,33 @@ else
   )
 fi
 
-if [[ -n "${CACHED_SAMPLE_PATH}" || -n "${CACHED_DATA_META}" ]]; then
-  if [[ -n "${IMAGE_PATH}" || -n "${MASK_PATH}" ]]; then
-    echo "Cached mode does not accept IMAGE_PATH/MASK_PATH." >&2
+if [[ -n "${RAW_SOURCE_DIR}" || -n "${RAW_MASK_DIR}" || -n "${RAW_GT_DIR}" ]]; then
+  if [[ -z "${RAW_SOURCE_DIR}" || -z "${RAW_MASK_DIR}" || -z "${RAW_GT_DIR}" ]]; then
+    echo "RAW_SOURCE_DIR, RAW_MASK_DIR, and RAW_GT_DIR must all be set in raw-folder mode." >&2
     exit 1
   fi
+  if [[ -n "${IMAGE_PATH}" || -n "${MASK_PATH}" ]]; then
+    echo "Raw-folder mode does not accept IMAGE_PATH/MASK_PATH." >&2
+    exit 1
+  fi
+  if [[ -n "${PROMPT}" ]]; then
+    echo "PROMPT is ignored in CORNE object-removal raw-folder mode." >&2
+  fi
+  cmd+=(
+    --raw_source_dir "$RAW_SOURCE_DIR"
+    --raw_mask_dir "$RAW_MASK_DIR"
+    --raw_gt_dir "$RAW_GT_DIR"
+  )
+elif [[ -n "${IMAGE_PATH}" || -n "${MASK_PATH}" ]]; then
+  if [[ -z "${IMAGE_PATH}" || -z "${MASK_PATH}" ]]; then
+    echo "IMAGE_PATH and MASK_PATH must both be set in image mode." >&2
+    exit 1
+  fi
+  if [[ -n "${PROMPT}" ]]; then
+    echo "PROMPT is ignored in CORNE object-removal image mode." >&2
+  fi
+  cmd+=(--image_path "$IMAGE_PATH" --mask_path "$MASK_PATH")
+elif [[ -n "${CACHED_SAMPLE_PATH}" || -n "${CACHED_DATA_META}" ]]; then
   if [[ -n "${CACHED_SAMPLE_PATH}" ]]; then
     cmd+=(--cached_sample_path "$CACHED_SAMPLE_PATH")
   fi
@@ -96,14 +116,8 @@ if [[ -n "${CACHED_SAMPLE_PATH}" || -n "${CACHED_DATA_META}" ]]; then
   cmd+=(--cached_num_workers "$CACHED_NUM_WORKERS")
   cmd+=(--cached_prefetch_factor "$CACHED_PREFETCH_FACTOR")
 else
-  if [[ -z "${MASK_PATH}" ]]; then
-    echo "MASK_PATH must be set in image mode." >&2
-    exit 1
-  fi
-  if [[ -n "${PROMPT}" ]]; then
-    echo "PROMPT is ignored in CORNE object-removal image mode." >&2
-  fi
-  cmd+=(--image_path "$IMAGE_PATH" --mask_path "$MASK_PATH")
+  echo "Set either RAW_SOURCE_DIR/RAW_MASK_DIR/RAW_GT_DIR, IMAGE_PATH/MASK_PATH, or CACHED_SAMPLE_PATH/CACHED_DATA_META." >&2
+  exit 1
 fi
 
 if [[ -n "${LORA_PATH}" ]]; then
@@ -124,4 +138,4 @@ if [[ "${ENABLE_REFINEMENT}" == "1" ]]; then
 fi
 
 echo "Running: ${cmd[*]}"
-"${cmd[@]}"
+"${cmd[@]}" "$@"

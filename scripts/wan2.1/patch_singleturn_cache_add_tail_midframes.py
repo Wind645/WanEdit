@@ -24,15 +24,18 @@ from videox_fun.data.singleturn_dataset import load_singleturn_cache_payload
 
 
 OLD_TOTAL_FRAMES = 8
-NEW_TOTAL_FRAMES = 11
-PATCHED_MODE = "singleturn_object_removal_v3_tail_interp11"
+NEW_TOTAL_FRAMES = 21
+PATCHED_MODE = "singleturn_object_removal_v4_tail_interp21"
+TAIL_PATCH_STRATEGY = "rebuild_21_frames_from_F1_F2_F5_F8_with_uniform_interp_F2_to_F5_and_F5_to_F8"
+SOURCE_ANCHOR_FRAMES = [1, 2, 5, 8]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Patch cached SingleTurn object-removal samples from the original 8-frame tail layout "
-            "to an 11-frame version by inserting three midpoint frames between F5-F6, F6-F7, and F7-F8."
+            "to a 21-frame version by keeping anchor frames F1/F2/F5/F8 and uniformly interpolating "
+            "the F2->F5 and F5->F8 segments."
         )
     )
     parser.add_argument(
@@ -119,28 +122,48 @@ def _resolve_paths(args):
     return manifest_path, manifest, source_root, cache_paths, output_root, cache_output_dir
 
 
+def _uniform_lerp_segment(start: torch.Tensor, end: torch.Tensor, steps: int) -> torch.Tensor:
+    if steps <= 0:
+        shape = list(start.shape)
+        shape[1] = 0
+        return start.new_empty(shape)
+
+    alpha_shape = [1, steps] + [1] * (start.ndim - 2)
+    alphas = torch.arange(1, steps + 1, device=start.device, dtype=start.dtype).view(alpha_shape) / (steps + 1)
+    return torch.lerp(start, end, alphas)
+
+
+def _build_tail_patch_info() -> dict:
+    return {
+        "source_mode": "singleturn_object_removal_v2",
+        "target_mode": PATCHED_MODE,
+        "source_total_frames": OLD_TOTAL_FRAMES,
+        "target_total_frames": NEW_TOTAL_FRAMES,
+        "source_anchor_frames": SOURCE_ANCHOR_FRAMES,
+        "strategy": TAIL_PATCH_STRATEGY,
+    }
+
+
 def _insert_tail_midframes(sequence: torch.Tensor) -> torch.Tensor:
     if sequence.ndim < 2:
         raise ValueError(f"Expected at least 2 dims with frame axis in dim=1, got {tuple(sequence.shape)}")
     if sequence.shape[1] != OLD_TOTAL_FRAMES:
         raise ValueError(f"Expected {OLD_TOTAL_FRAMES} frames before patching, got {sequence.shape[1]}")
 
-    f5 = sequence[:, 4:5]
-    f6 = sequence[:, 5:6]
-    f7 = sequence[:, 6:7]
-    f8 = sequence[:, 7:8]
-    mid_56 = 0.5 * (f5 + f6)
-    mid_67 = 0.5 * (f6 + f7)
-    mid_78 = 0.5 * (f7 + f8)
+    src_f1 = sequence[:, 0:1]
+    src_f2 = sequence[:, 1:2]
+    src_f5 = sequence[:, 4:5]
+    src_f8 = sequence[:, 7:8]
+    interp_f2_to_f5 = _uniform_lerp_segment(src_f2, src_f5, steps=5)
+    interp_f5_to_f8 = _uniform_lerp_segment(src_f5, src_f8, steps=12)
     return torch.cat(
         [
-            sequence[:, :5],
-            mid_56,
-            f6,
-            mid_67,
-            f7,
-            mid_78,
-            f8,
+            src_f1,
+            src_f2,
+            interp_f2_to_f5,
+            src_f5,
+            interp_f5_to_f8,
+            src_f8,
         ],
         dim=1,
     )
@@ -172,13 +195,7 @@ def _patch_payload(payload: dict) -> dict:
 
     patched["mode"] = PATCHED_MODE
     patched["total_frames"] = NEW_TOTAL_FRAMES
-    patched["tail_patch"] = {
-        "source_mode": "singleturn_object_removal_v2",
-        "target_mode": PATCHED_MODE,
-        "source_total_frames": OLD_TOTAL_FRAMES,
-        "target_total_frames": NEW_TOTAL_FRAMES,
-        "strategy": "insert_midpoints_between_F5_F6_F6_F7_F7_F8",
-    }
+    patched["tail_patch"] = _build_tail_patch_info()
     return patched
 
 
@@ -226,19 +243,14 @@ def main():
                 patched_entry = dict(manifest_entry)
                 patched_entry["cache_path"] = str(output_cache_path.relative_to(output_root))
                 patched_entry["mode"] = PATCHED_MODE
-                patched_entry["tail_patch"] = {
-                    "source_mode": "singleturn_object_removal_v2",
-                    "target_mode": PATCHED_MODE,
-                    "source_total_frames": OLD_TOTAL_FRAMES,
-                    "target_total_frames": NEW_TOTAL_FRAMES,
-                    "strategy": "insert_midpoints_between_F5_F6_F6_F7_F7_F8",
-                }
+                patched_entry["tail_patch"] = _build_tail_patch_info()
                 manifest_entries.append(patched_entry)
             else:
                 manifest_entries.append(
                     {
                         "cache_path": str(output_cache_path.relative_to(output_root)),
                         "mode": PATCHED_MODE,
+                        "tail_patch": _build_tail_patch_info(),
                     }
                 )
             progress.set_postfix(processed=processed, skipped=skipped["already_exists"])
@@ -277,17 +289,11 @@ def main():
         {
             "mode": PATCHED_MODE,
             "dataset_type": metadata.get("dataset_type", "corne_object_removal"),
-            "conditioning_format": "11-frame 2-prefix mask-latent + clean-source-latent + densified tail interpolation",
+            "conditioning_format": "21-frame 2-prefix mask-latent + clean-source-latent + rebuilt anchors/interpolated tail",
             "prefix_frames": metadata.get("prefix_frames", 2),
             "total_frames": NEW_TOTAL_FRAMES,
             "source_total_frames": OLD_TOTAL_FRAMES,
-            "tail_patch": {
-                "source_mode": "singleturn_object_removal_v2",
-                "target_mode": PATCHED_MODE,
-                "source_total_frames": OLD_TOTAL_FRAMES,
-                "target_total_frames": NEW_TOTAL_FRAMES,
-                "strategy": "insert_midpoints_between_F5_F6_F6_F7_F7_F8",
-            },
+            "tail_patch": _build_tail_patch_info(),
             "num_samples_total": len(manifest_entries),
             "manifest_path": str(manifest_out_path.relative_to(output_root)),
         }

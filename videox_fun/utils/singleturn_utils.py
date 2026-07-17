@@ -1,11 +1,13 @@
 import contextlib
 import os
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageSequence
 
 from videox_fun.pipeline.pipeline_wan import retrieve_timesteps
 from videox_fun.utils.utils import save_videos_grid
@@ -16,9 +18,11 @@ SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES = 11
 SINGLETURN_OBJECT_REMOVAL_MODE_TO_TOTAL_FRAMES = {
     "singleturn_object_removal_v2": 8,
     "singleturn_object_removal_v3_tail_interp11": 11,
+    "singleturn_object_removal_v4_tail_interp21": 21,
 }
 SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 2
 SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES = 5
+SINGLETURN_TAIL_TRAJECTORY_PREFIX_FRAMES = 8
 SINGLETURN_TAIL_START = 2
 
 
@@ -178,6 +182,23 @@ def _normalize_singleturn_prefix_latent(name: str, latent: torch.Tensor) -> torc
     return latent
 
 
+def _normalize_singleturn_video_latents(
+    name: str,
+    latents: torch.Tensor,
+    *,
+    expected_frames: Optional[int] = None,
+) -> torch.Tensor:
+    if not torch.is_tensor(latents):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(latents)}")
+    if latents.ndim == 4:
+        latents = latents.unsqueeze(0)
+    elif latents.ndim != 5:
+        raise ValueError(f"{name} must have shape (B, C, T, H, W) or (C, T, H, W), got {tuple(latents.shape)}")
+    if expected_frames is not None and latents.shape[2] != expected_frames:
+        raise ValueError(f"{name} must contain exactly {expected_frames} frames, got {latents.shape[2]}")
+    return latents
+
+
 def _normalize_singleturn_prompt_context(
     prompt_embeds: torch.Tensor | List[torch.Tensor],
     prompt_seq_len: Optional[int | Sequence[int]] = None,
@@ -223,6 +244,68 @@ def _normalize_singleturn_prompt_context(
 
 def _interp(start: torch.Tensor, end: torch.Tensor, alpha: float) -> torch.Tensor:
     return (1.0 - alpha) * start + alpha * end
+
+
+def load_singleturn_video_frames(
+    video_path: str | os.PathLike[str],
+    *,
+    expected_frames: Optional[int] = None,
+) -> list[Image.Image]:
+    resolved_path = Path(video_path)
+    if not resolved_path.is_file():
+        raise FileNotFoundError(f"SingleTurn video file does not exist: {resolved_path}")
+
+    if resolved_path.suffix.lower() == ".gif":
+        with Image.open(resolved_path) as image:
+            frames = [frame.copy().convert("RGB") for frame in ImageSequence.Iterator(image)]
+    else:
+        reader = imageio.get_reader(os.fspath(resolved_path))
+        frames = []
+        try:
+            try:
+                total_frames = reader.count_frames()
+            except Exception:
+                total_frames = None
+
+            if total_frames is None or total_frames < 0:
+                for frame in reader:
+                    frames.append(Image.fromarray(frame).convert("RGB"))
+            else:
+                for frame_idx in range(total_frames):
+                    frames.append(Image.fromarray(reader.get_data(frame_idx)).convert("RGB"))
+        finally:
+            reader.close()
+
+    if expected_frames is not None and len(frames) != expected_frames:
+        raise ValueError(
+            f"Expected exactly {expected_frames} frames from {resolved_path}, got {len(frames)}."
+        )
+    return frames
+
+
+def encode_singleturn_video_to_latents(
+    vae,
+    video_path: str | os.PathLike[str],
+    sample_size: int | Sequence[int],
+    *,
+    device: torch.device,
+    weight_dtype: torch.dtype,
+    expected_frames: int = SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+) -> torch.Tensor:
+    sample_size = normalize_singleturn_sample_size(sample_size)
+    frames = load_singleturn_video_frames(video_path, expected_frames=expected_frames)
+    frame_latents = []
+    with torch.no_grad():
+        for frame in frames:
+            frame_tensor = preprocess_singleturn_image(
+                frame,
+                sample_size,
+                add_batch_dim=True,
+                add_frame_dim=True,
+            ).to(device=device, dtype=weight_dtype)
+            frame_latent = vae.encode(frame_tensor.permute(0, 2, 1, 3, 4))[0].mode()
+            frame_latents.append(frame_latent)
+    return torch.cat(frame_latents, dim=2)
 
 
 def get_singleturn_object_removal_total_frames_for_mode(
@@ -377,6 +460,27 @@ def build_singleturn_prefix_inference_latents(
             f"Got {tuple(source_frame_latent.shape)} and {tuple(tail_noise.shape)}."
         )
     return torch.cat([mask_frame_latent, source_frame_latent, tail_noise], dim=2)
+
+
+def build_singleturn_tail_trajectory_prefix_latents(
+    encoded_latents_11: torch.Tensor,
+) -> torch.Tensor:
+    encoded_latents_11 = _normalize_singleturn_video_latents(
+        "encoded_latents_11",
+        encoded_latents_11,
+        expected_frames=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+    )
+
+    f5 = encoded_latents_11[:, :, 4:5]
+    f9 = encoded_latents_11[:, :, 8:9]
+    f10 = encoded_latents_11[:, :, 9:10]
+    f11 = encoded_latents_11[:, :, 10:11]
+
+    prefix_latents = encoded_latents_11[:, :, :SINGLETURN_TAIL_TRAJECTORY_PREFIX_FRAMES].clone()
+    prefix_latents[:, :, 5:6] = 0.75 * f5 + 0.25 * f9
+    prefix_latents[:, :, 6:7] = 0.6 * f5 + 0.4 * f10
+    prefix_latents[:, :, 7:8] = 0.5 * f5 + 0.5 * f11
+    return prefix_latents
 
 
 def build_singleturn_loss_mask_like(
@@ -567,6 +671,26 @@ def prepare_singleturn_noisy_latents(
         )
         loss_mask = build_singleturn_loss_mask_from_start_frames(latents, supervised_start_frames)
     return noisy_latents, target, loss_mask
+
+
+def compute_singleturn_masked_mse_loss(
+    noise_pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    weighting: Optional[torch.Tensor] = None,
+    threshold: float = 50,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    noise_pred = noise_pred.float()
+    target = target.float()
+    diff = noise_pred - target
+    mse_loss = F.mse_loss(noise_pred, target, reduction="none")
+    effective_weights = (diff.abs() <= threshold).to(dtype=mse_loss.dtype)
+    if loss_mask is not None:
+        effective_weights = effective_weights * loss_mask.float()
+    if weighting is not None:
+        effective_weights = effective_weights * weighting.float()
+    return (mse_loss * effective_weights).sum() / effective_weights.sum().clamp_min(1.0)
 
 
 def zero_singleturn_prefix_prediction(
@@ -810,6 +934,156 @@ def generate_singleturn_sample_from_latents(
     )
 
 
+def generate_singleturn_tail_trajectory_sample_from_latents(
+    pipeline,
+    mask_frame_latent: torch.Tensor,
+    source_frame_latent: torch.Tensor,
+    prompt_embeds: torch.Tensor | List[torch.Tensor],
+    prefix_latents_8: torch.Tensor,
+    prompt_seq_len: Optional[int | Sequence[int]] = None,
+    negative_prompt: str = "",
+    guidance_scale: float = 5.0,
+    num_inference_steps: int = 50,
+    generator: Optional[torch.Generator] = None,
+    weight_dtype: Optional[torch.dtype] = None,
+    max_sequence_length: int = 512,
+    return_step_latents: bool = False,
+):
+    device = pipeline._execution_device
+    weight_dtype = weight_dtype or getattr(pipeline.transformer, "dtype", torch.float32)
+    do_classifier_free_guidance = guidance_scale > 1.0
+
+    mask_frame_latent = _normalize_singleturn_prefix_latent("mask_frame_latent", mask_frame_latent).to(
+        device=device,
+        dtype=weight_dtype,
+    )
+    source_frame_latent = _normalize_singleturn_prefix_latent("source_frame_latent", source_frame_latent).to(
+        device=device,
+        dtype=weight_dtype,
+    )
+    prefix_latents_8 = _normalize_singleturn_video_latents(
+        "prefix_latents_8",
+        prefix_latents_8,
+        expected_frames=SINGLETURN_TAIL_TRAJECTORY_PREFIX_FRAMES,
+    ).to(device=device, dtype=weight_dtype)
+    _ensure_matching_shapes(source_frame_latent, mask_frame_latent, "mask_frame_latent")
+    if prefix_latents_8.shape[0] != source_frame_latent.shape[0]:
+        raise ValueError(
+            "prefix_latents_8 batch size does not match source_frame_latent batch size: "
+            f"{prefix_latents_8.shape[0]} vs {source_frame_latent.shape[0]}."
+        )
+    if prefix_latents_8.shape[1] != source_frame_latent.shape[1] or prefix_latents_8.shape[-2:] != source_frame_latent.shape[-2:]:
+        raise ValueError(
+            "prefix_latents_8 must share channel and spatial shape with source_frame_latent. "
+            f"Got {tuple(prefix_latents_8.shape)} and {tuple(source_frame_latent.shape)}."
+        )
+
+    prompt_context = _normalize_singleturn_prompt_context(prompt_embeds, prompt_seq_len)
+    prompt_context = [embed.to(device=device, dtype=weight_dtype) for embed in prompt_context]
+    if not prompt_context:
+        raise ValueError("prompt_context must not be empty.")
+    if len(prompt_context) != prefix_latents_8.shape[0]:
+        raise ValueError(
+            "prompt_context batch size does not match prefix_latents_8 batch size: "
+            f"{len(prompt_context)} vs {prefix_latents_8.shape[0]}."
+        )
+
+    negative_prompt_context = None
+    if do_classifier_free_guidance:
+        negative_prompt_context = pipeline._get_t5_prompt_embeds(
+            prompt=[negative_prompt or ""] * len(prompt_context),
+            num_videos_per_prompt=1,
+            max_sequence_length=max_sequence_length,
+            device=device,
+            dtype=weight_dtype,
+        )
+        context = negative_prompt_context + prompt_context
+    else:
+        context = prompt_context
+
+    timesteps, _ = retrieve_timesteps(
+        pipeline.scheduler,
+        num_inference_steps,
+        device=device,
+        mu=1,
+    )
+    extra_step_kwargs = pipeline.prepare_extra_step_kwargs(generator, eta=0.0)
+
+    tail_noise = torch.randn(
+        (
+            prefix_latents_8.shape[0],
+            prefix_latents_8.shape[1],
+            SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES - SINGLETURN_TAIL_TRAJECTORY_PREFIX_FRAMES,
+            prefix_latents_8.shape[3],
+            prefix_latents_8.shape[4],
+        ),
+        device=device,
+        generator=generator,
+        dtype=weight_dtype,
+    )
+    latents = torch.cat([prefix_latents_8, tail_noise], dim=2)
+    init_latents = latents.detach().clone()
+    seq_len = compute_wan_seq_len_from_latents(latents, pipeline.transformer.config.patch_size)
+    step_latents = [latents.detach().clone()] if return_step_latents else None
+
+    def autocast_context():
+        if device.type == "cuda" and weight_dtype != torch.float32:
+            return torch.autocast("cuda", dtype=weight_dtype)
+        return contextlib.nullcontext()
+
+    for timestep in timesteps:
+        latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+        if hasattr(pipeline.scheduler, "scale_model_input"):
+            latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, timestep)
+
+        with autocast_context():
+            noise_pred = pipeline.transformer(
+                x=latent_model_input,
+                context=context,
+                t=timestep.expand(latent_model_input.shape[0]),
+                seq_len=seq_len,
+            )
+
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        noise_pred = zero_singleturn_prefix_prediction(
+            noise_pred,
+            prefix_frames=SINGLETURN_TAIL_TRAJECTORY_PREFIX_FRAMES,
+        )
+        latents = pipeline.scheduler.step(
+            noise_pred,
+            timestep,
+            latents,
+            **extra_step_kwargs,
+            return_dict=False,
+        )[0]
+        latents = restore_singleturn_prefix(
+            latents,
+            prefix_latents_8,
+            prefix_frames=SINGLETURN_TAIL_TRAJECTORY_PREFIX_FRAMES,
+        )
+        if not torch.equal(latents[:, :, :SINGLETURN_TAIL_TRAJECTORY_PREFIX_FRAMES], prefix_latents_8):
+            raise RuntimeError("Frozen SingleTurn trajectory prefix drifted after scheduler overwrite.")
+        if return_step_latents:
+            step_latents.append(latents.detach().clone())
+
+    full_frames = decode_singleturn_latent_frames(pipeline.vae, latents, decode_dtype=weight_dtype).cpu()
+    tail_frames = full_frames[:, :, SINGLETURN_TAIL_START:].contiguous()
+    result = {
+        "formatted_prompt": CORNE_SINGLETURN_PROMPT,
+        "full_frames": full_frames,
+        "tail_frames": tail_frames,
+        "latents": latents.detach().cpu(),
+        "init_latents": init_latents.detach().cpu(),
+        "prefix_latents": prefix_latents_8.detach().cpu(),
+    }
+    if return_step_latents:
+        result["step_latents"] = [value.detach().cpu() for value in step_latents]
+    return result
+
+
 def refine_singleturn_sample_from_latents(
     pipeline,
     coarse_latents: torch.Tensor,
@@ -906,18 +1180,22 @@ def save_singleturn_outputs(
     output_dir: str,
     stem: str = "singleturn",
     fps: int = 4,
+    video_format: str = "gif",
 ) -> Dict[str, str]:
     os.makedirs(output_dir, exist_ok=True)
     full_frames = full_frames.detach().cpu().float()
     tail_frames = tail_frames.detach().cpu().float()
+    video_format = str(video_format).lower()
+    if video_format not in {"gif", "mp4"}:
+        raise ValueError(f"video_format must be 'gif' or 'mp4', got {video_format!r}")
 
-    full_gif = os.path.join(output_dir, f"{stem}_full.gif")
-    tail_gif = os.path.join(output_dir, f"{stem}_tail.gif")
+    full_video = os.path.join(output_dir, f"{stem}_full.{video_format}")
+    tail_video = os.path.join(output_dir, f"{stem}_tail.{video_format}")
     full_last = os.path.join(output_dir, f"{stem}_frame8.png")
     tail_last = os.path.join(output_dir, f"{stem}_tail_frame8.png")
 
-    save_videos_grid(full_frames, full_gif, fps=fps)
-    save_videos_grid(tail_frames, tail_gif, fps=fps)
+    save_videos_grid(full_frames, full_video, fps=fps)
+    save_videos_grid(tail_frames, tail_video, fps=fps)
 
     full_last_frame = (full_frames[0, :, -1].permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
     tail_last_frame = (tail_frames[0, :, -1].permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
@@ -925,8 +1203,12 @@ def save_singleturn_outputs(
     Image.fromarray(tail_last_frame).save(tail_last)
 
     return {
-        "full_gif": full_gif,
-        "tail_gif": tail_gif,
+        "full_gif": full_video if video_format == "gif" else "",
+        "tail_gif": tail_video if video_format == "gif" else "",
+        "full_mp4": full_video if video_format == "mp4" else "",
+        "tail_mp4": tail_video if video_format == "mp4" else "",
+        "full_video": full_video,
+        "tail_video": tail_video,
         "full_last_frame": full_last,
         "tail_last_frame": tail_last,
     }

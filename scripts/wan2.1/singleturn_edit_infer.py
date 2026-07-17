@@ -4,8 +4,10 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import Optional
+from shutil import copyfile
+from typing import Any, Optional
 
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
@@ -25,7 +27,11 @@ for project_root in project_roots:
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from videox_fun.data.singleturn_dataset import CachedSingleTurnLatentDataset, load_singleturn_cache_payload
+from videox_fun.data.singleturn_dataset import (
+    CachedSingleTurnLatentDataset,
+    IMAGE_EXTENSIONS,
+    load_singleturn_cache_payload,
+)
 from videox_fun.models import AutoencoderKLWan, WanT5EncoderModel, WanTransformer3DModel
 from videox_fun.pipeline import WanPipeline
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
@@ -44,6 +50,8 @@ from videox_fun.utils.singleturn_utils import (
     save_singleturn_outputs,
 )
 from videox_fun.utils.utils import filter_kwargs
+
+ALLOWED_SINGLETURN_COARSE_TOTAL_FRAMES = (11, 21)
 
 
 def resolve_model_path(model_root, subpath, default_subpath):
@@ -86,6 +94,29 @@ def _resolve_cache_path(cache_path: str, cached_data_dir: Optional[str]) -> str:
     if os.path.isabs(cache_path) or cached_data_dir is None:
         return cache_path
     return os.path.join(cached_data_dir, cache_path)
+
+
+def _validate_singleturn_coarse_total_frames(
+    total_frames: int,
+    *,
+    source: str,
+    cache_mode: Optional[str] = None,
+    cache_path: Optional[str] = None,
+) -> int:
+    total_frames = int(total_frames)
+    if total_frames in ALLOWED_SINGLETURN_COARSE_TOTAL_FRAMES:
+        return total_frames
+
+    details = [f"{source}={total_frames}"]
+    if cache_mode is not None:
+        details.append(f"cache_mode={cache_mode!r}")
+    if cache_path:
+        details.append(f"cache_path={cache_path}")
+    allowed_values = ", ".join(str(value) for value in ALLOWED_SINGLETURN_COARSE_TOTAL_FRAMES)
+    raise ValueError(
+        "SingleTurn coarse inference only supports total_frames in "
+        f"{{{allowed_values}}}. Got {', '.join(details)}."
+    )
 
 
 def _load_shared_prompt_cache(shared_prompt_cache: str):
@@ -148,6 +179,7 @@ def _save_singleturn_variant(
     stem: str,
     generation: dict,
     fps: int,
+    video_format: str,
 ):
     os.makedirs(output_dir, exist_ok=True)
     return save_singleturn_outputs(
@@ -156,6 +188,7 @@ def _save_singleturn_variant(
         output_dir=output_dir,
         stem=stem,
         fps=fps,
+        video_format=video_format,
     )
 
 
@@ -178,12 +211,14 @@ def _save_singleturn_result(
     generation: dict,
     metadata: dict,
     fps: int,
+    video_format: str,
 ):
     output_paths = _save_singleturn_variant(
         output_dir=output_dir,
         stem=stem,
         generation=generation,
         fps=fps,
+        video_format=video_format,
     )
     metadata_path = _write_singleturn_metadata(
         output_dir=output_dir,
@@ -191,6 +226,171 @@ def _save_singleturn_result(
         metadata={**metadata, "outputs": output_paths},
     )
     return output_paths, metadata_path
+
+
+def _warn(message: str) -> None:
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+def _resolve_ranked_output_path(output_dir: str, filename: str, *, local_rank: int, world_size: int) -> str:
+    if world_size == 1:
+        return os.path.join(output_dir, filename)
+    stem, suffix = os.path.splitext(filename)
+    return os.path.join(output_dir, f"{stem}.rank{local_rank}{suffix}")
+
+
+def _index_raw_folder(directory: str, extensions: tuple[str, ...]) -> tuple[dict[str, str], dict[str, list[str]]]:
+    path = Path(directory)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Expected raw-folder input directory does not exist: {directory}")
+
+    normalized_extensions = {extension.lower() for extension in extensions}
+    index: dict[str, str] = {}
+    duplicates: dict[str, list[str]] = {}
+    for candidate in sorted(path.iterdir(), key=lambda item: item.name):
+        if not candidate.is_file() or candidate.suffix.lower() not in normalized_extensions:
+            continue
+        key = candidate.stem
+        candidate_str = str(candidate)
+        if key in index:
+            duplicates.setdefault(key, [index[key]]).append(candidate_str)
+            continue
+        index[key] = candidate_str
+    return index, duplicates
+
+
+def _discover_raw_folder_samples(
+    *,
+    source_dir: str,
+    mask_dir: str,
+    gt_dir: str,
+    extensions: tuple[str, ...] = IMAGE_EXTENSIONS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    source_index, source_duplicates = _index_raw_folder(source_dir, extensions)
+    mask_index, mask_duplicates = _index_raw_folder(mask_dir, extensions)
+    gt_index, gt_duplicates = _index_raw_folder(gt_dir, extensions)
+
+    source_keys = set(source_index)
+    mask_keys = set(mask_index)
+    gt_keys = set(gt_index)
+    matched_keys = sorted(source_keys & mask_keys & gt_keys)
+    all_keys = sorted(source_keys | mask_keys | gt_keys)
+
+    samples = [
+        {
+            "index": index,
+            "key": key,
+            "source_path": source_index[key],
+            "mask_path": mask_index[key],
+            "gt_path": gt_index[key],
+        }
+        for index, key in enumerate(matched_keys)
+    ]
+
+    missing = []
+    for key in all_keys:
+        missing_in = []
+        if key not in source_index:
+            missing_in.append("source")
+        if key not in mask_index:
+            missing_in.append("mask")
+        if key not in gt_index:
+            missing_in.append("gt")
+        if missing_in:
+            missing.append(
+                {
+                    "key": key,
+                    "missing_in": missing_in,
+                    "source_path": source_index.get(key, ""),
+                    "mask_path": mask_index.get(key, ""),
+                    "gt_path": gt_index.get(key, ""),
+                }
+            )
+
+    duplicate_keys = {
+        "source": source_duplicates,
+        "mask": mask_duplicates,
+        "gt": gt_duplicates,
+    }
+    for directory_name, duplicates in duplicate_keys.items():
+        for key, paths in sorted(duplicates.items()):
+            _warn(
+                f"Duplicate raw-folder basename {key!r} detected in {directory_name}_dir; "
+                f"keeping {paths[0]} and ignoring {len(paths) - 1} additional file(s)."
+            )
+
+    if missing:
+        _warn(
+            f"Raw-folder mode found {len(missing)} key(s) outside the source/mask/gt intersection; "
+            "see raw_infer_missing_summary.json for details."
+        )
+
+    summary = {
+        "source_dir": source_dir,
+        "mask_dir": mask_dir,
+        "gt_dir": gt_dir,
+        "extensions": list(extensions),
+        "matched_count": len(samples),
+        "missing_count": len(missing),
+        "duplicate_counts": {
+            "source": len(source_duplicates),
+            "mask": len(mask_duplicates),
+            "gt": len(gt_duplicates),
+        },
+        "missing": missing,
+        "duplicates": duplicate_keys,
+    }
+    return samples, summary
+
+
+def _write_json(output_path: str, payload: Any) -> str:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return output_path
+
+
+def _encode_singleturn_frame_latent(pipeline, frame_tensor: torch.Tensor, weight_dtype: torch.dtype) -> torch.Tensor:
+    return pipeline.vae.encode(
+        frame_tensor.to(device=pipeline._execution_device, dtype=weight_dtype).permute(0, 2, 1, 3, 4)
+    )[0].mode()
+
+
+def _sample_generator_for_index(device: torch.device, seed: int, index: int) -> torch.Generator:
+    return torch.Generator(device=device).manual_seed(int(seed) + int(index))
+
+
+def _save_raw_folder_generation(
+    *,
+    output_dir: str,
+    sample_index: int,
+    generation: dict,
+    fps: int,
+    video_format: str,
+) -> dict[str, str]:
+    videos_dir = os.path.join(output_dir, "generated_videos")
+    last_frame_dir = os.path.join(output_dir, "generated_last_frame")
+    os.makedirs(videos_dir, exist_ok=True)
+    os.makedirs(last_frame_dir, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(dir=output_dir, prefix=f".raw_singleturn_{sample_index:06d}_") as tmpdir:
+        tmp_outputs = save_singleturn_outputs(
+            full_frames=generation["full_frames"],
+            tail_frames=generation["tail_frames"],
+            output_dir=tmpdir,
+            stem="singleturn",
+            fps=fps,
+            video_format=video_format,
+        )
+        final_video_path = os.path.join(videos_dir, f"{sample_index:06d}.{video_format}")
+        final_last_frame_path = os.path.join(last_frame_dir, f"{sample_index:06d}.png")
+        copyfile(tmp_outputs["full_video"], final_video_path)
+        copyfile(tmp_outputs["full_last_frame"], final_last_frame_path)
+
+    return {
+        "generated_video_path": final_video_path,
+        "generated_last_frame_path": final_last_frame_path,
+    }
 
 
 def _enable_refinement_lora(pipeline, args, device: torch.device, weight_dtype: torch.dtype):
@@ -243,6 +443,7 @@ def _save_two_stage_singleturn_result(
     refined_generation: Optional[dict],
     metadata: dict,
     fps: int,
+    video_format: str,
 ):
     if refined_generation is None:
         output_paths = _save_singleturn_variant(
@@ -250,6 +451,7 @@ def _save_two_stage_singleturn_result(
             stem=stem,
             generation=coarse_generation,
             fps=fps,
+            video_format=video_format,
         )
         metadata_path = _write_singleturn_metadata(
             output_dir=output_dir,
@@ -263,12 +465,14 @@ def _save_two_stage_singleturn_result(
         stem=f"{stem}_coarse",
         generation=coarse_generation,
         fps=fps,
+        video_format=video_format,
     )
     refined_output_paths = _save_singleturn_variant(
         output_dir=output_dir,
         stem=f"{stem}_refined",
         generation=refined_generation,
         fps=fps,
+        video_format=video_format,
     )
     metadata_path = _write_singleturn_metadata(
         output_dir=output_dir,
@@ -334,6 +538,10 @@ def _save_singleturn_input_visuals(
 
 
 def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
+    total_frames = _validate_singleturn_coarse_total_frames(
+        args.singleturn_total_frames,
+        source="--singleturn_total_frames",
+    )
     source_tensor = preprocess_singleturn_image(args.image_path, args.sample_size).to(
         device=pipeline._execution_device,
         dtype=weight_dtype,
@@ -354,14 +562,14 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             num_inference_steps=args.num_inference_steps,
             generator=generator,
             weight_dtype=weight_dtype,
-            total_frames=args.singleturn_total_frames,
+            total_frames=total_frames,
         )
         refined_generation = None
         if args.enable_refinement:
-            if args.singleturn_total_frames != SINGLETURN_TOTAL_FRAMES:
+            if total_frames != SINGLETURN_TOTAL_FRAMES:
                 raise ValueError(
                     "The current refinement stage only supports 8-frame coarse latents. "
-                    f"Got singleturn_total_frames={args.singleturn_total_frames}."
+                    f"Got singleturn_total_frames={total_frames}."
                 )
             pipeline = _enable_refinement_lora(pipeline, args, pipeline._execution_device, weight_dtype)
             try:
@@ -400,7 +608,7 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "sample_size": list(args.sample_size),
-            "singleturn_total_frames": args.singleturn_total_frames,
+            "singleturn_total_frames": total_frames,
             "input_previews": preview_paths,
             "coarse_lora_path": args.lora_path or "",
             "coarse_lora_alpha": args.lora_alpha,
@@ -410,6 +618,7 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             "refinement_guidance_scale": args.refinement_guidance_scale,
         },
         fps=args.fps,
+        video_format=args.video_format,
     )
 
     return {
@@ -435,7 +644,12 @@ def _run_singleturn_cached_sample(
         mask_frame_path = sample.get("mask_check_image", "")
 
     with torch.no_grad():
-        total_frames = int(sample.get("total_frames", SINGLETURN_TOTAL_FRAMES))
+        total_frames = _validate_singleturn_coarse_total_frames(
+            sample.get("total_frames", SINGLETURN_TOTAL_FRAMES),
+            source="cached payload total_frames",
+            cache_mode=sample.get("cache_mode"),
+            cache_path=sample.get("cache_path"),
+        )
         coarse_generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
             mask_frame_latent=sample["mask_frame_latent"],
@@ -510,6 +724,7 @@ def _run_singleturn_cached_sample(
             "refinement_guidance_scale": args.refinement_guidance_scale,
         },
         fps=args.fps,
+        video_format=args.video_format,
     )
 
     return {
@@ -672,6 +887,159 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
     return {"outputs": results, "summary": summary_path}
 
 
+def _run_singleturn_raw_folder_mode(
+    pipeline,
+    args,
+    weight_dtype: torch.dtype,
+    default_prompt_cache: dict,
+):
+    total_frames = _validate_singleturn_coarse_total_frames(
+        args.singleturn_total_frames,
+        source="--singleturn_total_frames",
+    )
+    local_rank, world_size = _get_distributed_context()
+    all_samples, missing_summary = _discover_raw_folder_samples(
+        source_dir=args.raw_source_dir,
+        mask_dir=args.raw_mask_dir,
+        gt_dir=args.raw_gt_dir,
+    )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    missing_summary_path = _write_json(
+        _resolve_ranked_output_path(
+            args.output_dir,
+            "raw_infer_missing_summary.json",
+            local_rank=local_rank,
+            world_size=world_size,
+        ),
+        missing_summary,
+    )
+
+    if not all_samples:
+        raise ValueError(
+            "Raw-folder mode found no matched samples across source/mask/gt directories. "
+            f"See {missing_summary_path} for missing-key details."
+        )
+
+    assigned_samples = all_samples[local_rank::world_size] if world_size > 1 else all_samples
+    resized_gt_dir = os.path.join(args.output_dir, "resized_gt")
+    resized_mask_dir = os.path.join(args.output_dir, "resized_mask")
+    os.makedirs(resized_gt_dir, exist_ok=True)
+    os.makedirs(resized_mask_dir, exist_ok=True)
+
+    results = []
+    for sample in tqdm(
+        assigned_samples,
+        desc="Running raw-folder SingleTurn inference",
+        disable=not assigned_samples,
+    ):
+        sample_index = int(sample["index"])
+        sample_key = sample["key"]
+        resized_gt_path = os.path.join(resized_gt_dir, f"{sample_index:06d}.png")
+        resized_mask_path = os.path.join(resized_mask_dir, f"{sample_index:06d}.png")
+        record = {
+            "index": sample_index,
+            "key": sample_key,
+            "source_path": sample["source_path"],
+            "mask_path": sample["mask_path"],
+            "gt_path": sample["gt_path"],
+            "resized_gt_path": resized_gt_path,
+            "resized_mask_path": resized_mask_path,
+            "generated_video_path": "",
+            "generated_last_frame_path": "",
+            "singleturn_total_frames": total_frames,
+            "status": "pending",
+        }
+
+        try:
+            source_tensor = preprocess_singleturn_image(sample["source_path"], args.sample_size)
+            gt_tensor = preprocess_singleturn_image(sample["gt_path"], args.sample_size)
+            mask_tensor = preprocess_singleturn_mask(sample["mask_path"], args.sample_size)
+            mask_frame_tensor = preprocess_singleturn_mask_frame(sample["mask_path"], args.sample_size)
+
+            _tensor_image_to_pil(gt_tensor[0, 0]).save(resized_gt_path)
+            _tensor_mask_to_pil(mask_tensor[0, 0]).save(resized_mask_path)
+
+            sample_generator = _sample_generator_for_index(pipeline._execution_device, args.seed, sample_index)
+            with torch.no_grad():
+                coarse_generation = generate_singleturn_sample_from_latents(
+                    pipeline=pipeline,
+                    mask_frame_latent=_encode_singleturn_frame_latent(pipeline, mask_frame_tensor, weight_dtype),
+                    source_frame_latent=_encode_singleturn_frame_latent(pipeline, source_tensor, weight_dtype),
+                    prompt_embeds=default_prompt_cache["prompt_embeds"],
+                    prompt_seq_len=default_prompt_cache["prompt_seq_len"],
+                    negative_prompt=args.negative_prompt,
+                    guidance_scale=args.guidance_scale,
+                    num_inference_steps=args.num_inference_steps,
+                    generator=sample_generator,
+                    weight_dtype=weight_dtype,
+                    total_frames=total_frames,
+                )
+                final_generation = coarse_generation
+                if args.enable_refinement:
+                    if total_frames != SINGLETURN_TOTAL_FRAMES:
+                        raise ValueError(
+                            "The current refinement stage only supports 8-frame coarse latents. "
+                            f"Got singleturn_total_frames={total_frames} for raw sample key={sample_key!r}."
+                        )
+                    pipeline = _enable_refinement_lora(
+                        pipeline,
+                        args,
+                        pipeline._execution_device,
+                        weight_dtype,
+                    )
+                    try:
+                        final_generation = refine_singleturn_sample_from_latents(
+                            pipeline=pipeline,
+                            coarse_latents=coarse_generation["latents"],
+                            prompt_embeds=default_prompt_cache["prompt_embeds"],
+                            prompt_seq_len=default_prompt_cache["prompt_seq_len"],
+                            negative_prompt=args.negative_prompt,
+                            guidance_scale=args.refinement_guidance_scale,
+                            weight_dtype=weight_dtype,
+                        )
+                    finally:
+                        pipeline = _restore_coarse_lora(
+                            pipeline,
+                            args,
+                            pipeline._execution_device,
+                            weight_dtype,
+                        )
+
+            output_paths = _save_raw_folder_generation(
+                output_dir=args.output_dir,
+                sample_index=sample_index,
+                generation=final_generation,
+                fps=args.fps,
+                video_format=args.video_format,
+            )
+            record.update(output_paths)
+            record["status"] = "ok"
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            record["status"] = "error"
+            record["error"] = str(exc)
+            _warn(f"Raw-folder inference failed for key={sample_key!r} index={sample_index}: {exc}")
+
+        results.append(record)
+
+    manifest_path = _write_json(
+        _resolve_ranked_output_path(
+            args.output_dir,
+            "raw_infer_manifest.json",
+            local_rank=local_rank,
+            world_size=world_size,
+        ),
+        results,
+    )
+    return {
+        "outputs": results,
+        "summary": manifest_path,
+        "missing_summary": missing_summary_path,
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="SingleTurn CORNE object-removal inference")
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True, help="Base Wan model path.")
@@ -682,6 +1050,9 @@ def parse_args():
     parser.add_argument("--cached_data_meta", type=str, default=None, help="Manifest for cached SingleTurn samples.")
     parser.add_argument("--cached_data_dir", type=str, default=None, help="Root directory used to resolve relative cache paths.")
     parser.add_argument("--shared_prompt_cache", type=str, default=None, help="Optional shared prompt embedding cache.")
+    parser.add_argument("--raw_source_dir", type=str, default=None, help="Raw-folder source image directory.")
+    parser.add_argument("--raw_mask_dir", type=str, default=None, help="Raw-folder mask directory.")
+    parser.add_argument("--raw_gt_dir", type=str, default=None, help="Raw-folder ground-truth directory.")
     parser.add_argument("--cached_start_index", type=int, default=0, help="Start index when iterating over cached manifests.")
     parser.add_argument("--cached_num_samples", type=int, default=None, help="Optional limit when iterating over cached manifests.")
     parser.add_argument("--cached_num_workers", type=int, default=2, help="CPU workers used to load cached samples.")
@@ -709,18 +1080,35 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=4, help="GIF playback FPS.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Inference weight dtype.")
     parser.add_argument(
+        "--video_format",
+        type=str,
+        default="gif",
+        choices=["gif", "mp4"],
+        help="Saved preview video format. mp4 uses H.264 via ffmpeg/imageio.",
+    )
+    parser.add_argument(
         "--singleturn_total_frames",
         type=int,
         default=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
-        help="Total latent frames used in direct image-mode SingleTurn inference. Cached mode ignores this and follows the cache payload.",
+        help="Coarse SingleTurn total frames for direct image mode. Allowed values: 11 or 21. Cached mode follows the cache payload.",
     )
     args = parser.parse_args()
 
     cache_mode = args.cached_sample_path is not None or args.cached_data_meta is not None
     image_mode = args.image_path is not None or args.mask_path is not None
-    if cache_mode and image_mode:
-        raise ValueError("Choose either direct image mode or cached mode, not both.")
-    if not cache_mode:
+    raw_mode = args.raw_source_dir is not None or args.raw_mask_dir is not None or args.raw_gt_dir is not None
+    selected_mode_count = int(cache_mode) + int(image_mode) + int(raw_mode)
+    if selected_mode_count != 1:
+        raise ValueError(
+            "Choose exactly one inference mode: direct image mode, cached mode, or raw-folder mode."
+        )
+
+    if raw_mode:
+        if args.raw_source_dir is None or args.raw_mask_dir is None or args.raw_gt_dir is None:
+            raise ValueError(
+                "Raw-folder mode requires --raw_source_dir, --raw_mask_dir, and --raw_gt_dir together."
+            )
+    elif image_mode:
         if args.image_path is None or args.mask_path is None:
             raise ValueError("Image mode requires both --image_path and --mask_path.")
     else:
@@ -737,8 +1125,10 @@ def parse_args():
         raise ValueError("--enable_refinement requires --refinement_lora_path.")
     if (not args.enable_refinement) and args.refinement_lora_path is not None:
         raise ValueError("--refinement_lora_path requires --enable_refinement.")
-    if args.singleturn_total_frames < 8:
-        raise ValueError(f"--singleturn_total_frames must be >= 8, got {args.singleturn_total_frames}.")
+    args.singleturn_total_frames = _validate_singleturn_coarse_total_frames(
+        args.singleturn_total_frames,
+        source="--singleturn_total_frames",
+    )
 
     args.sample_size = normalize_singleturn_sample_size(args.sample_size)
     if any(dim % 16 != 0 for dim in args.sample_size):
@@ -825,7 +1215,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     default_prompt_cache = _encode_fixed_prompt(tokenizer, text_encoder, device, weight_dtype)
 
-    if args.cached_sample_path is not None or args.cached_data_meta is not None:
+    if args.raw_source_dir is not None or args.raw_mask_dir is not None or args.raw_gt_dir is not None:
+        result = _run_singleturn_raw_folder_mode(
+            pipeline=pipeline,
+            args=args,
+            weight_dtype=weight_dtype,
+            default_prompt_cache=default_prompt_cache,
+        )
+    elif args.cached_sample_path is not None or args.cached_data_meta is not None:
         result = _run_singleturn_cached_mode(
             pipeline=pipeline,
             args=args,

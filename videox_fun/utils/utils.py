@@ -74,7 +74,19 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=6, f
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if imageio_backend:
         if path.endswith("mp4"):
-            imageio.mimsave(path, outputs, fps=fps)
+            writer = imageio.get_writer(
+                path,
+                format="FFMPEG",
+                mode="I",
+                fps=fps,
+                codec="libx264",
+                ffmpeg_params=["-pix_fmt", "yuv420p"],
+            )
+            try:
+                for frame in outputs:
+                    writer.append_data(np.asarray(frame))
+            finally:
+                writer.close()
         else:
             imageio.mimsave(path, outputs, duration=(1000 * 1/fps))
     else:

@@ -22,7 +22,6 @@ import gc
 import logging
 import math
 import os
-import pickle
 import shutil
 import sys
 
@@ -34,7 +33,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 import torchvision.transforms.functional as TF
 import transformers
-from accelerate import Accelerator
+from accelerate import Accelerator, skip_first_batches
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -99,7 +98,7 @@ from videox_fun.utils.lora_utils import create_network, merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
                                                SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
                                                build_singleturn_object_removal_latents,
-                                               build_singleturn_loss_mask_like,
+                                               compute_singleturn_masked_mse_loss,
                                                compute_wan_seq_len_from_latents,
                                                generate_singleturn_sample,
                                                normalize_singleturn_sample_size,
@@ -137,6 +136,77 @@ def resolve_model_path(model_root, subpath, default_subpath):
         return sibling_candidate
 
     return subpath
+
+
+TRAINING_STATE_FILENAME = "training_state.json"
+
+
+def _checkpoint_training_state_path(checkpoint_dir: str) -> str:
+    return os.path.join(checkpoint_dir, TRAINING_STATE_FILENAME)
+
+
+def _normalize_resume_position(epoch: int, step_in_epoch: int, steps_per_epoch: int) -> tuple[int, int]:
+    epoch = int(epoch)
+    step_in_epoch = int(step_in_epoch)
+    steps_per_epoch = max(1, int(steps_per_epoch))
+    if step_in_epoch < 0:
+        step_in_epoch = 0
+    while step_in_epoch >= steps_per_epoch:
+        epoch += 1
+        step_in_epoch -= steps_per_epoch
+    return epoch, step_in_epoch
+
+
+def _save_training_state(
+    checkpoint_dir: str,
+    *,
+    global_step: int,
+    epoch: int,
+    step_in_epoch: int,
+    steps_per_epoch: int,
+) -> str:
+    next_epoch, next_step_in_epoch = _normalize_resume_position(
+        epoch,
+        step_in_epoch + 1,
+        steps_per_epoch,
+    )
+    payload = {
+        "global_step": int(global_step),
+        "next_epoch": int(next_epoch),
+        "resume_step_in_epoch": int(next_step_in_epoch),
+        "steps_per_epoch": int(steps_per_epoch),
+        "saved_from_epoch": int(epoch),
+        "saved_after_step_in_epoch": int(step_in_epoch),
+    }
+    state_path = _checkpoint_training_state_path(checkpoint_dir)
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return state_path
+
+
+def _load_training_state(
+    checkpoint_dir: str,
+    *,
+    fallback_global_step: int,
+    steps_per_epoch: int,
+) -> tuple[int, int, int]:
+    state_path = _checkpoint_training_state_path(checkpoint_dir)
+    if not os.path.exists(state_path):
+        fallback_epoch = fallback_global_step // max(1, int(steps_per_epoch))
+        return fallback_global_step, fallback_epoch, 0
+
+    with open(state_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    global_step = int(payload.get("global_step", fallback_global_step))
+    next_epoch = int(payload.get("next_epoch", global_step // max(1, int(steps_per_epoch))))
+    resume_step_in_epoch = int(payload.get("resume_step_in_epoch", 0))
+    next_epoch, resume_step_in_epoch = _normalize_resume_position(
+        next_epoch,
+        resume_step_in_epoch,
+        steps_per_epoch,
+    )
+    return global_step, next_epoch, resume_step_in_epoch
 
 
 class CachedVideoLatentDataset(Dataset):
@@ -1551,22 +1621,6 @@ def main():
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        def save_sampler_state(output_dir):
-            if batch_sampler is None or not hasattr(batch_sampler, "sampler") or not hasattr(batch_sampler.sampler, "_pos_start"):
-                return
-            with open(os.path.join(output_dir, "sampler_pos_start.pkl"), 'wb') as file:
-                pickle.dump([batch_sampler.sampler._pos_start, first_epoch], file)
-
-        def load_sampler_state(input_dir):
-            if batch_sampler is None or not hasattr(batch_sampler, "sampler") or not hasattr(batch_sampler.sampler, "_pos_start"):
-                return
-            pkl_path = os.path.join(input_dir, "sampler_pos_start.pkl")
-            if os.path.exists(pkl_path):
-                with open(pkl_path, 'rb') as file:
-                    loaded_number, _ = pickle.load(file)
-                    batch_sampler.sampler._pos_start = max(loaded_number - args.dataloader_num_workers * accelerator.num_processes * 2, 0)
-                print(f"Load pkl from {pkl_path}. Get loaded_number = {loaded_number}.")
-
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         if fsdp_stage != 0:
             def save_model_hook(models, weights, output_dir):
@@ -1581,17 +1635,15 @@ def main():
                             network_state_dict[key.replace("network.", "")] = accelerate_state_dict[key].to(weight_dtype)
 
                     save_file(network_state_dict, safetensor_save_path, metadata={"format": "pt"})
-                    save_sampler_state(output_dir)
 
             def load_model_hook(models, input_dir):
-                load_sampler_state(input_dir)
+                return
         elif zero_stage == 3:
             def save_model_hook(models, weights, output_dir):
-                if accelerator.is_main_process:
-                    save_sampler_state(output_dir)
+                return
 
             def load_model_hook(models, input_dir):
-                load_sampler_state(input_dir)
+                return
         else:
             def save_model_hook(models, weights, output_dir):
                 if accelerator.is_main_process:
@@ -1601,10 +1653,8 @@ def main():
                         for _ in range(len(weights)):
                             weights.pop()
 
-                    save_sampler_state(output_dir)
-
             def load_model_hook(models, input_dir):
-                load_sampler_state(input_dir)
+                return
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -2016,94 +2066,51 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    resume_step_in_epoch = 0
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+            checkpoint_folder_path = args.resume_from_checkpoint
+            if not os.path.isdir(checkpoint_folder_path):
+                checkpoint_folder_path = os.path.join(
+                    args.output_dir,
+                    os.path.basename(os.path.normpath(args.resume_from_checkpoint)),
+                )
+            path = os.path.basename(os.path.normpath(checkpoint_folder_path))
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
+            checkpoint_folder_path = os.path.join(args.output_dir, path) if path is not None else None
 
-        if path is None:
+        if path is None or checkpoint_folder_path is None or not os.path.isdir(checkpoint_folder_path):
             accelerator.print(
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
-            global_step = int(path.split("-")[1])
+            fallback_global_step = int(path.split("-")[1])
+            if args.save_state:
+                accelerator.load_state(checkpoint_folder_path)
+                accelerator.print(f"Loaded full training state from {checkpoint_folder_path}.")
+                global_step, first_epoch, resume_step_in_epoch = _load_training_state(
+                    checkpoint_folder_path,
+                    fallback_global_step=fallback_global_step,
+                    steps_per_epoch=len(train_dataloader),
+                )
+            else:
+                global_step = fallback_global_step
+                first_epoch = global_step // num_update_steps_per_epoch
 
             initial_global_step = global_step
-
-            checkpoint_folder_path = os.path.join(args.output_dir, path)
-            pkl_path = os.path.join(checkpoint_folder_path, "sampler_pos_start.pkl")
-            if os.path.exists(pkl_path):
-                with open(pkl_path, 'rb') as file:
-                    _, first_epoch = pickle.load(file)
-            else:
-                first_epoch = global_step // num_update_steps_per_epoch
-            print(f"Load pkl from {pkl_path}. Get first_epoch = {first_epoch}.")
-
-            if zero_stage != 3 and not args.use_fsdp:
-                from safetensors.torch import load_file
-                state_dict = load_file(os.path.join(checkpoint_folder_path, "lora_diffusion_pytorch_model.safetensors"), device=str(accelerator.device))
-                m, u = accelerator.unwrap_model(network).load_state_dict(state_dict, strict=False)
-                print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-
-                optimizer_file_pt = os.path.join(checkpoint_folder_path, "optimizer.pt")
-                optimizer_file_bin = os.path.join(checkpoint_folder_path, "optimizer.bin")
-                optimizer_file_to_load = None
-
-                if os.path.exists(optimizer_file_pt):
-                    optimizer_file_to_load = optimizer_file_pt
-                elif os.path.exists(optimizer_file_bin):
-                    optimizer_file_to_load = optimizer_file_bin
-
-                if optimizer_file_to_load:
-                    try:
-                        accelerator.print(f"Loading optimizer state from {optimizer_file_to_load}")
-                        optimizer_state = torch.load(optimizer_file_to_load, map_location=accelerator.device)
-                        optimizer.load_state_dict(optimizer_state)
-                        accelerator.print("Optimizer state loaded successfully.")
-                    except Exception as e:
-                        accelerator.print(f"Failed to load optimizer state from {optimizer_file_to_load}: {e}")
-
-                scheduler_file_pt = os.path.join(checkpoint_folder_path, "scheduler.pt")
-                scheduler_file_bin = os.path.join(checkpoint_folder_path, "scheduler.bin")
-                scheduler_file_to_load = None
-
-                if os.path.exists(scheduler_file_pt):
-                    scheduler_file_to_load = scheduler_file_pt
-                elif os.path.exists(scheduler_file_bin):
-                    scheduler_file_to_load = scheduler_file_bin
-
-                if scheduler_file_to_load:
-                    try:
-                        accelerator.print(f"Loading scheduler state from {scheduler_file_to_load}")
-                        scheduler_state = torch.load(scheduler_file_to_load, map_location=accelerator.device)
-                        lr_scheduler.load_state_dict(scheduler_state)
-                        accelerator.print("Scheduler state loaded successfully.")
-                    except Exception as e:
-                        accelerator.print(f"Failed to load scheduler state from {scheduler_file_to_load}: {e}")
-
-                if hasattr(accelerator, 'scaler') and accelerator.scaler is not None:
-                    scaler_file = os.path.join(checkpoint_folder_path, "scaler.pt")
-                    if os.path.exists(scaler_file):
-                        try:
-                            accelerator.print(f"Loading GradScaler state from {scaler_file}")
-                            scaler_state = torch.load(scaler_file, map_location=accelerator.device)
-                            accelerator.scaler.load_state_dict(scaler_state)
-                            accelerator.print("GradScaler state loaded successfully.")
-                        except Exception as e:
-                            accelerator.print(f"Failed to load GradScaler state: {e}")
-
-            else:
-                accelerator.load_state(checkpoint_folder_path)
-                accelerator.print("accelerator.load_state() completed for zero_stage 3.")
+            accelerator.print(
+                f"Resuming from global_step={global_step}, first_epoch={first_epoch}, "
+                f"resume_step_in_epoch={resume_step_in_epoch}."
+            )
 
     else:
         initial_global_step = 0
@@ -2113,6 +2120,16 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         accelerator.print(f"\nsaving checkpoint: {ckpt_file}")
         unwrapped_nw.save_weights(ckpt_file, weight_dtype, None)
+
+    def save_checkpoint_state(checkpoint_dir: str, *, epoch: int, step_in_epoch: int):
+        state_path = _save_training_state(
+            checkpoint_dir,
+            global_step=global_step,
+            epoch=epoch,
+            step_in_epoch=step_in_epoch,
+            steps_per_epoch=len(train_dataloader),
+        )
+        accelerator.print(f"Saved training progress to {state_path}")
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -2131,12 +2148,20 @@ def main():
         vae_stream_2 = None
 
     idx_sampling = DiscreteSampling(args.train_sampling_steps, uniform_sampling=args.uniform_sampling)
+    last_seen_epoch = max(first_epoch, 0)
+    last_seen_step_in_epoch = max(resume_step_in_epoch - 1, -1)
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         if batch_sampler is not None and hasattr(batch_sampler, "sampler") and hasattr(batch_sampler.sampler, "generator"):
             batch_sampler.sampler.generator = torch.Generator().manual_seed(args.seed + epoch)
-        for step, batch in enumerate(train_dataloader):
+        epoch_resume_step = resume_step_in_epoch if epoch == first_epoch else 0
+        epoch_dataloader = train_dataloader
+        if epoch_resume_step > 0:
+            epoch_dataloader = skip_first_batches(train_dataloader, epoch_resume_step)
+        for step, batch in enumerate(epoch_dataloader, start=epoch_resume_step):
+            last_seen_epoch = epoch
+            last_seen_step_in_epoch = step
             if (not use_cached_data) and epoch == first_epoch and step == 0:
                 os.makedirs(os.path.join(args.output_dir, "sanity_check"), exist_ok=True)
                 if args.singleturn_mode:
@@ -2164,7 +2189,6 @@ def main():
             with accelerator.accumulate(transformer3d):
                 batch_texts = None
                 singleturn_loss_mask = None
-                singleturn_supervised_start_frames = None
                 singleturn_refine_target_latents = None
                 singleturn_refine_loss_weight_map = None
                 if use_cached_data:
@@ -2486,76 +2510,11 @@ def main():
                 else:
                     sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                     if args.singleturn_mode:
-                        use_dynamic_singleturn_tail_start = False
-                        if latents.shape[2] == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES:
-                            if use_cached_data:
-                                batch_total_frames = batch.get("total_frames")
-                                batch_cache_modes = batch.get("cache_mode")
-                                if isinstance(batch_total_frames, torch.Tensor):
-                                    total_frames_match = bool(
-                                        (batch_total_frames == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES).all().item()
-                                    )
-                                else:
-                                    total_frames_values = (
-                                        [int(value) for value in batch_total_frames]
-                                        if isinstance(batch_total_frames, (list, tuple))
-                                        else [int(batch_total_frames)]
-                                    )
-                                    total_frames_match = all(
-                                        value == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES for value in total_frames_values
-                                    )
-                                cache_modes = (
-                                    list(batch_cache_modes)
-                                    if isinstance(batch_cache_modes, (list, tuple))
-                                    else [batch_cache_modes]
-                                )
-                                cache_mode_match = all(
-                                    cache_mode == "singleturn_object_removal_v3_tail_interp11" for cache_mode in cache_modes
-                                )
-                                use_dynamic_singleturn_tail_start = total_frames_match and cache_mode_match
-                            else:
-                                use_dynamic_singleturn_tail_start = True
-
-                        if use_dynamic_singleturn_tail_start:
-                            singleturn_supervised_start_frames = torch.randint(
-                                3,
-                                SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES + 1,
-                                (latents.shape[0],),
-                                device=latents.device,
-                            )
                         noisy_latents, target, singleturn_loss_mask = prepare_singleturn_noisy_latents(
                             latents,
                             noise,
                             sigmas,
-                            supervised_start_frames=singleturn_supervised_start_frames,
                         )
-                        if (
-                            singleturn_supervised_start_frames is not None
-                            and args.debug_shapes
-                            and accelerator.is_local_main_process
-                        ):
-                            should_log = (
-                                (global_step == 0 and step < 2)
-                                or (global_step > 0 and (global_step % args.debug_log_interval == 0))
-                            )
-                            if should_log:
-                                sampled_start_frames = singleturn_supervised_start_frames.detach().cpu()
-                                sampled_hist_frames, sampled_hist_counts = torch.unique(
-                                    sampled_start_frames,
-                                    return_counts=True,
-                                )
-                                hist_payload = {
-                                    int(frame): int(count)
-                                    for frame, count in zip(sampled_hist_frames.tolist(), sampled_hist_counts.tolist())
-                                }
-                                supervised_frame_counts = (
-                                    SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES - sampled_start_frames + 1
-                                ).tolist()
-                                print(
-                                    "[DEBUG] singleturn supervised_start_frames="
-                                    f"{sampled_start_frames.tolist()} supervised_frame_counts={supervised_frame_counts} "
-                                    f"hist={hist_payload}"
-                                )
                     else:
                         noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
@@ -2604,10 +2563,10 @@ def main():
                     weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
                     # Check if video edit loss mode is enabled
                     if args.singleturn_mode:
-                        loss = custom_mse_loss(
+                        loss = compute_singleturn_masked_mse_loss(
                             noise_pred.float(),
                             target.float(),
-                            weighting.float(),
+                            weighting=weighting.float(),
                             loss_mask=singleturn_loss_mask.float(),
                         )
                     elif args.video_edit_loss_on_edited_frames_only:
@@ -2676,6 +2635,11 @@ def main():
                         else:
                             accelerator_save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                             accelerator.save_state(accelerator_save_path)
+                            save_checkpoint_state(
+                                accelerator_save_path,
+                                epoch=epoch,
+                                step_in_epoch=step,
+                            )
                             logger.info(f"Saved state to {accelerator_save_path}")
 
                 if accelerator.is_main_process:
@@ -2699,6 +2663,8 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
+
+        resume_step_in_epoch = 0
 
         if accelerator.is_main_process:
             if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
@@ -2725,6 +2691,11 @@ def main():
         else:
             accelerator_save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
             accelerator.save_state(accelerator_save_path)
+            save_checkpoint_state(
+                accelerator_save_path,
+                epoch=last_seen_epoch,
+                step_in_epoch=max(last_seen_step_in_epoch, 0),
+            )
             logger.info(f"Saved state to {accelerator_save_path}")
 
     accelerator.end_training()
