@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
+    SINGLETURN_OBJECT_REMOVAL_CACHE_MODE,
     is_supported_singleturn_object_removal_mode,
     normalize_singleturn_sample_size,
     preprocess_singleturn_image,
@@ -129,16 +130,57 @@ def _build_corne_record(
         return None
 
     mask_sam_path = _resolve_companion_file(mask_sam_dir, stem) if mask_sam_dir.is_dir() else None
-    used_mask_sam = mask_sam_path is not None
+    if mask_sam_path is None:
+        return None
+    used_mask_sam = True
     return {
         "source_image": str(shot_path),
         "bg_image": str(bg_path),
         "mask_check_image": str(mask_check_path),
-        "mask_sam_image": str(mask_sam_path) if mask_sam_path is not None else None,
+        "mask_sam_image": str(mask_sam_path),
         "used_mask_sam": used_mask_sam,
-        "mask_frame_image": str(mask_sam_path if used_mask_sam else mask_check_path),
+        "mask_frame_image": str(mask_sam_path),
         "type": "image",
         "file_path": str(shot_path),
+    }
+
+
+def inspect_singleturn_corne_records(data_root: str) -> Dict[str, Any]:
+    shot_dir, bg_dir, mask_check_dir, mask_sam_dir = _corne_dirs(data_root)
+    records: List[Dict[str, Any]] = []
+    dropped_missing_mask_sam = 0
+    dropped_missing_mask_check = 0
+
+    for shot_path in _iter_image_files(shot_dir):
+        stem = shot_path.stem
+        bg_path = _resolve_companion_file(bg_dir, stem)
+        if bg_path is None:
+            continue
+        mask_check_path = _resolve_companion_file(mask_check_dir, stem)
+        if mask_check_path is None:
+            dropped_missing_mask_check += 1
+            continue
+        mask_sam_path = _resolve_companion_file(mask_sam_dir, stem) if mask_sam_dir.is_dir() else None
+        if mask_sam_path is None:
+            dropped_missing_mask_sam += 1
+            continue
+        records.append(
+            {
+                "source_image": str(shot_path),
+                "bg_image": str(bg_path),
+                "mask_check_image": str(mask_check_path),
+                "mask_sam_image": str(mask_sam_path),
+                "used_mask_sam": True,
+                "mask_frame_image": str(mask_sam_path),
+                "type": "image",
+                "file_path": str(shot_path),
+            }
+        )
+
+    return {
+        "records": records,
+        "dropped_missing_mask_sam": dropped_missing_mask_sam,
+        "dropped_missing_mask_check": dropped_missing_mask_check,
     }
 
 
@@ -152,16 +194,12 @@ def discover_singleturn_records(
             "Point --train_data_dir at the CORNE root instead."
         )
 
-    shot_dir, bg_dir, mask_check_dir, mask_sam_dir = _corne_dirs(data_root)
-    records: List[Dict[str, Any]] = []
-    for shot_path in _iter_image_files(shot_dir):
-        record = _build_corne_record(shot_path, bg_dir, mask_check_dir, mask_sam_dir)
-        if record is not None:
-            records.append(record)
+    inspection = inspect_singleturn_corne_records(data_root)
+    records = inspection["records"]
 
     if not records:
         raise ValueError(
-            "No valid CORNE object-removal samples were found. Each sample basename must exist in shot/, bg/, and mask-check/."
+            "No valid CORNE object-removal samples were found. Each sample basename must exist in shot/, bg/, mask-check/, and mask_sam/."
         )
     return records
 
@@ -194,6 +232,12 @@ class SingleTurnEditDataset(Dataset):
             ),
             "pixel_values_mask_frame": preprocess_singleturn_mask_frame(
                 record["mask_frame_image"],
+                self.video_sample_size,
+                add_batch_dim=False,
+                add_frame_dim=True,
+            ),
+            "pixel_values_mask_check_frame": preprocess_singleturn_mask_frame(
+                record["mask_check_image"],
                 self.video_sample_size,
                 add_batch_dim=False,
                 add_frame_dim=True,
@@ -249,8 +293,13 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
         self.total_length = None
         self.num_samples_with_mask_sam = 0
         self.num_samples_without_mask_sam = 0
+        self.dropped_missing_mask_sam = 0
+        self.dropped_missing_mask_check = 0
         self.stopped_early_when_quotas_met = False
-        self._shot_dir, self._bg_dir, self._mask_check_dir, self._mask_sam_dir = _corne_dirs(data_root)
+        inspection = inspect_singleturn_corne_records(data_root)
+        self.records = inspection["records"]
+        self.dropped_missing_mask_sam = int(inspection["dropped_missing_mask_sam"])
+        self.dropped_missing_mask_check = int(inspection["dropped_missing_mask_check"])
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -268,7 +317,7 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
         remaining_skip_with_mask_sam = self.skip_samples_with_mask_sam
         remaining_skip_without_mask_sam = self.skip_samples_without_mask_sam
 
-        for global_index, shot_path in enumerate(_iter_image_files(self._shot_dir)):
+        for global_index, record in enumerate(self.records):
             if (
                 self.num_samples_with_mask_sam >= self.max_samples_with_mask_sam
                 and self.num_samples_without_mask_sam >= self.max_samples_without_mask_sam
@@ -276,11 +325,7 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
                 self.stopped_early_when_quotas_met = True
                 break
 
-            record = _build_corne_record(shot_path, self._bg_dir, self._mask_check_dir, self._mask_sam_dir)
-            if record is None:
-                continue
-
-            used_mask_sam = bool(record["used_mask_sam"])
+            used_mask_sam = True
             if used_mask_sam:
                 if remaining_skip_with_mask_sam > 0:
                     remaining_skip_with_mask_sam -= 1
@@ -305,6 +350,12 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
                 ),
                 "pixel_values_mask_frame": preprocess_singleturn_mask_frame(
                     record["mask_frame_image"],
+                    self.sample_size,
+                    add_batch_dim=False,
+                    add_frame_dim=True,
+                ),
+                "pixel_values_mask_check_frame": preprocess_singleturn_mask_frame(
+                    record["mask_check_image"],
                     self.sample_size,
                     add_batch_dim=False,
                     add_frame_dim=True,
@@ -383,7 +434,7 @@ class CachedSingleTurnLatentDataset(Dataset):
 
         payload_mode = payload.get("mode")
         if self.expected_mode == "singleturn_object_removal_cached":
-            mode_matches = is_supported_singleturn_object_removal_mode(payload_mode)
+            mode_matches = payload_mode == SINGLETURN_OBJECT_REMOVAL_CACHE_MODE
         else:
             mode_matches = payload_mode == self.expected_mode
         if not mode_matches:
@@ -426,27 +477,28 @@ class CachedSingleTurnLatentDataset(Dataset):
             "data_type": "image",
             "idx": index,
         }
-        if self.expected_mode == "singleturn_object_removal_cached" or is_supported_singleturn_object_removal_mode(self.expected_mode):
+        if self.expected_mode == "singleturn_object_removal_cached" or self.expected_mode == SINGLETURN_OBJECT_REMOVAL_CACHE_MODE:
             missing = [
                 key
-                for key in ("full_latents", "mask_frame_latent", "source_frame_latent", "edge_weight_map")
+                for key in (
+                    "mask_sam_latent",
+                    "mask_check_latent",
+                    "source_frame_latent",
+                    "noisy_anchor_latent",
+                    "target_latent",
+                )
                 if key not in payload
             ]
             if missing:
                 raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}")
-            total_frames = int(payload.get("total_frames", payload["full_latents"].shape[-3]))
-            if payload["full_latents"].shape[-3] != total_frames:
-                raise ValueError(
-                    f"Cached SingleTurn sample {cache_path} has {payload['full_latents'].shape[-3]} frames; "
-                    f"expected {total_frames}."
-                )
             sample.update(
                 {
-                    "full_latents": payload["full_latents"],
-                    "mask_frame_latent": payload["mask_frame_latent"],
+                    "mask_sam_latent": payload["mask_sam_latent"],
+                    "mask_check_latent": payload["mask_check_latent"],
                     "source_frame_latent": payload["source_frame_latent"],
-                    "edge_weight_map": payload["edge_weight_map"],
-                    "total_frames": total_frames,
+                    "noisy_anchor_latent": payload["noisy_anchor_latent"],
+                    "target_latent": payload["target_latent"],
+                    "singleturn_sample_size": payload.get("singleturn_sample_size", entry.get("singleturn_sample_size", [])),
                     "cache_mode": payload_mode,
                 }
             )

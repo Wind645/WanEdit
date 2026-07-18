@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export MODEL_NAME=${MODEL_NAME:-models/Wan2.1-T2V-1.3B}
-export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v4_tail_interp21}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
+
+export PYTHON_BIN=${PYTHON_BIN:-/home/data/zhikai/miniconda3/envs/videocof/bin/python}
+export ACCELERATE_BIN=${ACCELERATE_BIN:-/home/data/zhikai/miniconda3/envs/videocof/bin/accelerate}
+export MODEL_NAME=${MODEL_NAME:-/home/data/zhikai/VideoCoF/models/Wan2.1-T2V-1.3B}
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1_60000_mixedmask_fixed}
 export CACHED_DATA_META=${CACHED_DATA_META:-${CACHED_DATA_DIR}/manifest.json}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2,4,5}
-export OUTPUT_DIR=${OUTPUT_DIR:-/home/data/nas_hdd/CORNE_extracted/ckpt/singleturn_coarse_f21_twoprefix_trainagain}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export OUTPUT_DIR=${OUTPUT_DIR:-/home/data/nas_hdd/CORNE_extracted/ckpt/singleturn_coarse_sam_strict_keyframe_cache_v1_60000_mixedmask_fixed}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export WANDB_MODE=${WANDB_MODE:-online}
 export REPORT_TO=${REPORT_TO:-wandb}
-export TRACKER_PROJECT_NAME=${TRACKER_PROJECT_NAME:-wan2.1-singleturn-object-removal-f21-twoprefix}
+export TRACKER_PROJECT_NAME=${TRACKER_PROJECT_NAME:-wan2.1-singleturn-object-removal-sam-strict-keyframe-cache-v1-60000-mixedmask-fixed}
 export WANDB_ENTITY=${WANDB_ENTITY:-}
 export RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
 export SAVE_STATE=${SAVE_STATE:-1}
@@ -19,20 +24,36 @@ export SINGLETURN_VALIDATION_IMAGE_PATH=${SINGLETURN_VALIDATION_IMAGE_PATH:-}
 export SINGLETURN_VALIDATION_MASK_PATH=${SINGLETURN_VALIDATION_MASK_PATH:-}
 export SINGLETURN_VALIDATION_NEGATIVE_PROMPT=${SINGLETURN_VALIDATION_NEGATIVE_PROMPT:-}
 
-NPROC_PER_NODE=${NPROC_PER_NODE:-4}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}
+NPROC_PER_NODE=${NPROC_PER_NODE:-1}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-1}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
-NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-2}
+NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-10}
 CHECKPOINTING_STEPS=${CHECKPOINTING_STEPS:-100}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-4}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 SEED=${SEED:-42}
 SAMPLE_HEIGHT=${SAMPLE_HEIGHT:-480}
 SAMPLE_WIDTH=${SAMPLE_WIDTH:-832}
+CORRUPTION_FRAME=${CORRUPTION_FRAME:-2}
+RESTORATION_FRAME=${RESTORATION_FRAME:-14}
 SINGLETURN_VALIDATION_GUIDANCE_SCALE=${SINGLETURN_VALIDATION_GUIDANCE_SCALE:-5.0}
 SINGLETURN_VALIDATION_NUM_INFERENCE_STEPS=${SINGLETURN_VALIDATION_NUM_INFERENCE_STEPS:-50}
 SINGLETURN_VALIDATION_FPS=${SINGLETURN_VALIDATION_FPS:-4}
-DEEPSPEED_CONFIG_FILE=${DEEPSPEED_CONFIG_FILE:-/tmp/wan2.1_singleturn_cached_zero2_${USER}_$$.json}
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python interpreter does not exist: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
+if [[ ! -x "${ACCELERATE_BIN}" ]]; then
+  echo "Accelerate launcher does not exist: ${ACCELERATE_BIN}" >&2
+  exit 1
+fi
+
+if [[ ! -d "${MODEL_NAME}" ]]; then
+  echo "Model directory does not exist: ${MODEL_NAME}" >&2
+  exit 1
+fi
 
 if [[ ! -f "${CACHED_DATA_META}" ]]; then
   echo "Cached manifest does not exist: ${CACHED_DATA_META}" >&2
@@ -44,50 +65,21 @@ if [[ "${NPROC_PER_NODE}" -le 0 || "${TRAIN_BATCH_SIZE}" -le 0 || "${GRADIENT_AC
   exit 1
 fi
 
-TOTAL_TRAIN_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * NPROC_PER_NODE))
-
-cat > "${DEEPSPEED_CONFIG_FILE}" <<EOF
-{
-    "bf16": {
-        "enabled": true
-    },
-    "train_micro_batch_size_per_gpu": ${TRAIN_BATCH_SIZE},
-    "train_batch_size": ${TOTAL_TRAIN_BATCH_SIZE},
-    "gradient_accumulation_steps": ${GRADIENT_ACCUMULATION_STEPS},
-    "gradient_clipping": 0.05,
-    "zero_optimization": {
-        "stage": 2,
-        "offload_optimizer": {
-            "device": "none"
-        },
-        "overlap_comm": true,
-        "contiguous_gradients": true,
-        "sub_group_size": 1e9,
-        "reduce_bucket_size": 5e8,
-        "allgather_partitions": true,
-        "allgather_bucket_size": 2e8,
-        "reduce_scatter": true
-    },
-    "steps_per_print": 100,
-    "wall_clock_breakdown": false
-}
-EOF
-
 cmd=(
-  accelerate launch
-  --use_deepspeed
-  --deepspeed_config_file "$DEEPSPEED_CONFIG_FILE"
+  "$ACCELERATE_BIN" launch
   --num_processes "$NPROC_PER_NODE"
   --num_machines 1
   --dynamo_backend no
   --mixed_precision bf16
-  scripts/wan2.1/train_lora.py
-  --config_path config/wan2.1/wan_civitai.yaml
+  "$REPO_ROOT/scripts/wan2.1/train_lora.py"
+  --config_path "$REPO_ROOT/config/wan2.1/wan_civitai.yaml"
   --pretrained_model_name_or_path "$MODEL_NAME"
   --singleturn_mode
   --cached_data_dir "$CACHED_DATA_DIR"
   --cached_data_meta "$CACHED_DATA_META"
   --singleturn_sample_size "$SAMPLE_HEIGHT" "$SAMPLE_WIDTH"
+  --corruption_frame "$CORRUPTION_FRAME"
+  --restoration_frame "$RESTORATION_FRAME"
   --report_to "$REPORT_TO"
   --tracker_project_name "$TRACKER_PROJECT_NAME"
   --tracker_entity "$WANDB_ENTITY"
@@ -106,7 +98,6 @@ cmd=(
   --adam_epsilon 1e-10
   --max_grad_norm 0.05
   --uniform_sampling
-  --use_deepspeed
 )
 
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then

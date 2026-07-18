@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export MODEL_NAME=${MODEL_NAME:-models/Wan2.1-T2V-1.3B}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
+
+export PYTHON_BIN=${PYTHON_BIN:-/home/data/zhikai/miniconda3/envs/videocof/bin/python}
+export ACCELERATE_BIN=${ACCELERATE_BIN:-/home/data/zhikai/miniconda3/envs/videocof/bin/accelerate}
+export MODEL_NAME=${MODEL_NAME:-/home/data/zhikai/VideoCoF/models/Wan2.1-T2V-1.3B}
 export IMAGE_PATH=${IMAGE_PATH:-}
 export MASK_PATH=${MASK_PATH:-}
 export RAW_SOURCE_DIR=${RAW_SOURCE_DIR:-}
@@ -9,14 +14,14 @@ export RAW_MASK_DIR=${RAW_MASK_DIR:-}
 export RAW_GT_DIR=${RAW_GT_DIR:-}
 export PROMPT=${PROMPT:-}
 export CACHED_SAMPLE_PATH=${CACHED_SAMPLE_PATH:-}
-export CACHED_DATA_META=${CACHED_DATA_META:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix/manifest.json}
-export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix}
+export CACHED_DATA_META=${CACHED_DATA_META:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1/manifest.json}
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1}
 export SHARED_PROMPT_CACHE=${SHARED_PROMPT_CACHE:-}
 export CACHED_START_INDEX=${CACHED_START_INDEX:-0}
 export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-}
 export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/singleturn_object_removal_v3_twoprefix}
+export OUTPUT_DIR=${OUTPUT_DIR:-/home/data/zhikai/VideoCoF/outputs/singleturn_object_removal_sam_strict_keyframe_cache_v1}
 export VIDEO_FORMAT=${VIDEO_FORMAT:-gif}
 export LORA_PATH=${LORA_PATH:-}
 export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
@@ -29,6 +34,8 @@ NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-50}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-5.0}
 SAMPLE_HEIGHT=${SAMPLE_HEIGHT:-${SAMPLE_SIZE:-480}}
 SAMPLE_WIDTH=${SAMPLE_WIDTH:-${SAMPLE_SIZE:-832}}
+CORRUPTION_FRAME=${CORRUPTION_FRAME:-2}
+RESTORATION_FRAME=${RESTORATION_FRAME:-14}
 SEED=${SEED:-0}
 FPS=${FPS:-4}
 DTYPE=${DTYPE:-bf16}
@@ -40,13 +47,26 @@ elif [[ "${DTYPE}" == "fp32" ]]; then
   ACCELERATE_MIXED_PRECISION=no
 fi
 
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python interpreter does not exist: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
+if [[ ! -d "${MODEL_NAME}" ]]; then
+  echo "Model directory does not exist: ${MODEL_NAME}" >&2
+  exit 1
+fi
+
 cmd_base=(
-  scripts/wan2.1/singleturn_edit_infer.py
+  "$REPO_ROOT/scripts/wan2.1/singleturn_edit_infer.py"
   --pretrained_model_name_or_path "$MODEL_NAME"
   --output_dir "$OUTPUT_DIR"
+  --config_path "$REPO_ROOT/config/wan2.1/wan_civitai.yaml"
   --num_inference_steps "$NUM_INFERENCE_STEPS"
   --guidance_scale "$GUIDANCE_SCALE"
   --sample_size "$SAMPLE_HEIGHT" "$SAMPLE_WIDTH"
+  --corruption_frame "$CORRUPTION_FRAME"
+  --restoration_frame "$RESTORATION_FRAME"
   --seed "$SEED"
   --fps "$FPS"
   --dtype "$DTYPE"
@@ -54,9 +74,12 @@ cmd_base=(
 )
 
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
+  if [[ ! -x "${ACCELERATE_BIN}" ]]; then
+    echo "Accelerate launcher does not exist: ${ACCELERATE_BIN}" >&2
+    exit 1
+  fi
   cmd=(
-    accelerate
-    launch
+    "$ACCELERATE_BIN" launch
     --num_processes "$NPROC_PER_NODE"
     --num_machines 1
     --dynamo_backend no
@@ -65,7 +88,7 @@ if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   )
 else
   cmd=(
-    python
+    "$PYTHON_BIN"
     "${cmd_base[@]}"
   )
 fi

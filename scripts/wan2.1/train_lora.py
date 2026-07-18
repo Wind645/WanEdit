@@ -96,16 +96,17 @@ except ImportError:
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import create_network, merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
-                                               SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+                                               SINGLETURN_COARSE_FROZEN_FRAME_INDICES,
+                                               build_singleturn_noisy_anchor_latents,
                                                build_singleturn_object_removal_latents,
                                                compute_singleturn_masked_mse_loss,
+                                               compute_singleturn_object_removal_total_frames,
                                                compute_wan_seq_len_from_latents,
                                                generate_singleturn_sample,
                                                normalize_singleturn_sample_size,
                                                prepare_singleturn_noisy_latents,
                                                preprocess_singleturn_image,
                                                preprocess_singleturn_mask_frame,
-                                               resize_singleturn_mask_to_latent_grid,
                                                SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
                                                save_singleturn_outputs)
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
@@ -259,9 +260,29 @@ def load_cached_batch(batch, weight_dtype, device):
     return latents, prompt_embeds
 
 
-def load_cached_singleturn_batch(batch, weight_dtype, device, refinement_mode=False):
-    latent_key = "input_latents" if refinement_mode else "full_latents"
-    full_latents = batch[latent_key].to(device=device, dtype=weight_dtype, non_blocking=True)
+def load_cached_singleturn_batch(
+    batch,
+    weight_dtype,
+    device,
+    *,
+    refinement_mode=False,
+    corruption_frame=None,
+    restoration_frame=None,
+):
+    if refinement_mode:
+        full_latents = batch["input_latents"].to(device=device, dtype=weight_dtype, non_blocking=True)
+    else:
+        if corruption_frame is None or restoration_frame is None:
+            raise ValueError("Cached SingleTurn coarse loading requires corruption_frame and restoration_frame.")
+        full_latents = build_singleturn_object_removal_latents(
+            mask_sam_latent=batch["mask_sam_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
+            mask_check_latent=batch["mask_check_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
+            source_frame_latent=batch["source_frame_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
+            noisy_anchor_latent=batch["noisy_anchor_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
+            target_latent=batch["target_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
+            corruption_frame=corruption_frame,
+            restoration_frame=restoration_frame,
+        )
     prompt_embeds_padded = batch["prompt_embeds"].to(device=device, dtype=weight_dtype, non_blocking=True)
     prompt_seq_lens = batch["prompt_seq_len"].tolist()
     prompt_embeds = [embed[:seq_len] for embed, seq_len in zip(prompt_embeds_padded, prompt_seq_lens)]
@@ -467,14 +488,15 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
             with torch.no_grad():
                 generation = generate_singleturn_sample(
                     pipeline=pipeline,
-                    mask_frame_tensor=mask_frame_tensor,
+                    mask_sam_tensor=mask_frame_tensor,
                     source_tensor=source_tensor,
                     negative_prompt=args.singleturn_validation_negative_prompt,
                     guidance_scale=args.singleturn_validation_guidance_scale,
                     num_inference_steps=args.singleturn_validation_num_inference_steps,
                     generator=generator,
                     weight_dtype=weight_dtype,
-                    total_frames=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+                    corruption_frame=args.corruption_frame,
+                    restoration_frame=args.restoration_frame,
                 )
 
             output_paths = save_singleturn_outputs(
@@ -1106,6 +1128,18 @@ def parse_args():
         help="Optional non-square sample size for SingleTurn mode only.",
     )
     parser.add_argument(
+        "--corruption_frame",
+        type=int,
+        default=2,
+        help="Number of interpolation frames inserted between source and noisy-anchor in SingleTurn object-removal mode.",
+    )
+    parser.add_argument(
+        "--restoration_frame",
+        type=int,
+        default=14,
+        help="Number of interpolation frames inserted between noisy-anchor and target in SingleTurn object-removal mode.",
+    )
+    parser.add_argument(
         "--singleturn_validation_image_path",
         type=str,
         default=None,
@@ -1250,6 +1284,10 @@ def parse_args():
 
     if args.singleturn_refine_mode and not args.singleturn_mode:
         raise ValueError("SingleTurn refinement mode requires --singleturn_mode.")
+    if args.corruption_frame < 0:
+        raise ValueError("--corruption_frame must be >= 0.")
+    if args.restoration_frame < 0:
+        raise ValueError("--restoration_frame must be >= 0.")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
@@ -2204,6 +2242,8 @@ def main():
                                 weight_dtype=weight_dtype,
                                 device=accelerator.device,
                                 refinement_mode=args.singleturn_refine_mode,
+                                corruption_frame=args.corruption_frame,
+                                restoration_frame=args.restoration_frame,
                             )
                         else:
                             latents, prompt_embeds = load_cached_batch(
@@ -2216,7 +2256,8 @@ def main():
                 else:
                     if args.singleturn_mode:
                         src_pixel_values = batch["pixel_values_src_image"].to(weight_dtype)
-                        mask_frame_pixel_values = batch["pixel_values_mask_frame"].to(weight_dtype)
+                        mask_sam_pixel_values = batch["pixel_values_mask_frame"].to(weight_dtype)
+                        mask_check_frame_pixel_values = batch["pixel_values_mask_check_frame"].to(weight_dtype)
                         tgt_pixel_values = batch["pixel_values_tgt_image"].to(weight_dtype)
                         mask_check_pixel_values = batch["pixel_values_mask_check"].to(weight_dtype)
                         batch_texts = [CORNE_SINGLETURN_PROMPT] * src_pixel_values.shape[0]
@@ -2364,23 +2405,23 @@ def main():
                                 except Exception as _:
                                     pass
                         if args.singleturn_mode:
-                            mask_frame_latents = _batch_encode_vae(mask_frame_pixel_values, use_mode=True)
+                            mask_sam_latents = _batch_encode_vae(mask_sam_pixel_values, use_mode=True)
+                            mask_check_latents = _batch_encode_vae(mask_check_frame_pixel_values, use_mode=True)
                             source_latents = _batch_encode_vae(src_pixel_values, use_mode=True)
                             target_latents = _batch_encode_vae(tgt_pixel_values, use_mode=True)
-                            latent_mask = resize_singleturn_mask_to_latent_grid(mask_check_pixel_values, source_latents)
-                            noise_latents = torch.randn(
-                                source_latents.size(),
-                                device=source_latents.device,
+                            noisy_anchor_latents = build_singleturn_noisy_anchor_latents(
+                                source_latents,
+                                mask_check_pixel_values,
                                 generator=torch_rng,
-                                dtype=weight_dtype,
                             )
                             latents = build_singleturn_object_removal_latents(
-                                mask_frame_latent=mask_frame_latents,
+                                mask_sam_latent=mask_sam_latents,
+                                mask_check_latent=mask_check_latents,
                                 source_frame_latent=source_latents,
-                                bg_latent=target_latents,
-                                mask_check_latent=latent_mask,
-                                noise_latent=noise_latents,
-                                total_frames=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+                                noisy_anchor_latent=noisy_anchor_latents,
+                                target_latent=target_latents,
+                                corruption_frame=args.corruption_frame,
+                                restoration_frame=args.restoration_frame,
                             )
                         elif vae_stream_1 is not None:
                             vae_stream_1.wait_stream(torch.cuda.current_stream())
@@ -2514,6 +2555,7 @@ def main():
                             latents,
                             noise,
                             sigmas,
+                            frozen_frame_indices=SINGLETURN_COARSE_FROZEN_FRAME_INDICES,
                         )
                     else:
                         noisy_latents = (1.0 - sigmas) * latents + sigmas * noise

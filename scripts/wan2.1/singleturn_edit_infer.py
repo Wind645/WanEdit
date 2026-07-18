@@ -37,11 +37,11 @@ from videox_fun.pipeline import WanPipeline
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
-    SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+    SINGLETURN_OBJECT_REMOVAL_CACHE_MODE,
     SINGLETURN_TOTAL_FRAMES,
+    compute_singleturn_object_removal_total_frames,
     generate_singleturn_sample,
     generate_singleturn_sample_from_latents,
-    is_supported_singleturn_object_removal_mode,
     normalize_singleturn_sample_size,
     preprocess_singleturn_image,
     preprocess_singleturn_mask_frame,
@@ -50,8 +50,6 @@ from videox_fun.utils.singleturn_utils import (
     save_singleturn_outputs,
 )
 from videox_fun.utils.utils import filter_kwargs
-
-ALLOWED_SINGLETURN_COARSE_TOTAL_FRAMES = (11, 21)
 
 
 def resolve_model_path(model_root, subpath, default_subpath):
@@ -96,27 +94,23 @@ def _resolve_cache_path(cache_path: str, cached_data_dir: Optional[str]) -> str:
     return os.path.join(cached_data_dir, cache_path)
 
 
-def _validate_singleturn_coarse_total_frames(
-    total_frames: int,
+def _resolve_singleturn_total_frames(
+    corruption_frame: int,
+    restoration_frame: int,
     *,
     source: str,
     cache_mode: Optional[str] = None,
     cache_path: Optional[str] = None,
 ) -> int:
-    total_frames = int(total_frames)
-    if total_frames in ALLOWED_SINGLETURN_COARSE_TOTAL_FRAMES:
-        return total_frames
-
-    details = [f"{source}={total_frames}"]
-    if cache_mode is not None:
-        details.append(f"cache_mode={cache_mode!r}")
-    if cache_path:
-        details.append(f"cache_path={cache_path}")
-    allowed_values = ", ".join(str(value) for value in ALLOWED_SINGLETURN_COARSE_TOTAL_FRAMES)
-    raise ValueError(
-        "SingleTurn coarse inference only supports total_frames in "
-        f"{{{allowed_values}}}. Got {', '.join(details)}."
-    )
+    try:
+        return compute_singleturn_object_removal_total_frames(corruption_frame, restoration_frame)
+    except ValueError as exc:
+        details = [f"{source}=({int(corruption_frame)}, {int(restoration_frame)})"]
+        if cache_mode is not None:
+            details.append(f"cache_mode={cache_mode!r}")
+        if cache_path:
+            details.append(f"cache_path={cache_path}")
+        raise ValueError(f"Invalid SingleTurn coarse frame layout for {', '.join(details)}: {exc}") from exc
 
 
 def _load_shared_prompt_cache(shared_prompt_cache: str):
@@ -538,9 +532,10 @@ def _save_singleturn_input_visuals(
 
 
 def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
-    total_frames = _validate_singleturn_coarse_total_frames(
-        args.singleturn_total_frames,
-        source="--singleturn_total_frames",
+    total_frames = _resolve_singleturn_total_frames(
+        args.corruption_frame,
+        args.restoration_frame,
+        source="--corruption_frame/--restoration_frame",
     )
     source_tensor = preprocess_singleturn_image(args.image_path, args.sample_size).to(
         device=pipeline._execution_device,
@@ -555,14 +550,15 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
     with torch.no_grad():
         coarse_generation = generate_singleturn_sample(
             pipeline=pipeline,
-            mask_frame_tensor=mask_frame_tensor,
+            mask_sam_tensor=mask_frame_tensor,
             source_tensor=source_tensor,
             negative_prompt=args.negative_prompt,
             guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps,
             generator=generator,
             weight_dtype=weight_dtype,
-            total_frames=total_frames,
+            corruption_frame=args.corruption_frame,
+            restoration_frame=args.restoration_frame,
         )
         refined_generation = None
         if args.enable_refinement:
@@ -608,6 +604,8 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "sample_size": list(args.sample_size),
+            "corruption_frame": args.corruption_frame,
+            "restoration_frame": args.restoration_frame,
             "singleturn_total_frames": total_frames,
             "input_previews": preview_paths,
             "coarse_lora_path": args.lora_path or "",
@@ -644,15 +642,16 @@ def _run_singleturn_cached_sample(
         mask_frame_path = sample.get("mask_check_image", "")
 
     with torch.no_grad():
-        total_frames = _validate_singleturn_coarse_total_frames(
-            sample.get("total_frames", SINGLETURN_TOTAL_FRAMES),
-            source="cached payload total_frames",
+        total_frames = _resolve_singleturn_total_frames(
+            args.corruption_frame,
+            args.restoration_frame,
+            source="--corruption_frame/--restoration_frame",
             cache_mode=sample.get("cache_mode"),
             cache_path=sample.get("cache_path"),
         )
         coarse_generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
-            mask_frame_latent=sample["mask_frame_latent"],
+            mask_sam_latent=sample["mask_sam_latent"],
             source_frame_latent=sample["source_frame_latent"],
             prompt_embeds=prompt_cache["prompt_embeds"],
             prompt_seq_len=prompt_cache["prompt_seq_len"],
@@ -661,7 +660,8 @@ def _run_singleturn_cached_sample(
             num_inference_steps=args.num_inference_steps,
             generator=generator,
             weight_dtype=weight_dtype,
-            total_frames=total_frames,
+            corruption_frame=args.corruption_frame,
+            restoration_frame=args.restoration_frame,
         )
         refined_generation = None
         if args.enable_refinement:
@@ -712,6 +712,8 @@ def _run_singleturn_cached_sample(
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
+            "corruption_frame": args.corruption_frame,
+            "restoration_frame": args.restoration_frame,
             "singleturn_total_frames": total_frames,
             "cache_mode": sample.get("cache_mode", ""),
             "mask_frame_image": mask_frame_path,
@@ -757,12 +759,16 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 f"Cached SingleTurn sample {cache_path} uses the deprecated instructpix2pix posterior payload. "
                 "Re-run CORNE object-removal preprocess."
             )
-        if not is_supported_singleturn_object_removal_mode(payload.get("mode")):
+        if payload.get("mode") != SINGLETURN_OBJECT_REMOVAL_CACHE_MODE:
             raise ValueError(
                 f"Cached SingleTurn sample {cache_path} has unsupported mode={payload.get('mode')!r}. "
-                "Re-run CORNE object-removal preprocess / patch to generate a supported cache."
+                f"Expected {SINGLETURN_OBJECT_REMOVAL_CACHE_MODE!r}. Re-run CORNE object-removal preprocess."
             )
-        missing = [key for key in ("mask_frame_latent", "source_frame_latent") if key not in payload]
+        missing = [
+            key
+            for key in ("mask_sam_latent", "mask_check_latent", "source_frame_latent", "noisy_anchor_latent", "target_latent")
+            if key not in payload
+        ]
         if missing:
             raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}.")
 
@@ -771,8 +777,11 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             prompt_cache = _load_shared_prompt_cache(_resolve_cache_path(payload["shared_prompt_cache"], cached_data_dir))
 
         sample = {
-            "mask_frame_latent": payload["mask_frame_latent"],
+            "mask_sam_latent": payload["mask_sam_latent"],
+            "mask_check_latent": payload["mask_check_latent"],
             "source_frame_latent": payload["source_frame_latent"],
+            "noisy_anchor_latent": payload["noisy_anchor_latent"],
+            "target_latent": payload["target_latent"],
             "cache_path": cache_path,
             "source_image": payload.get("source_image", ""),
             "bg_image": payload.get("bg_image", ""),
@@ -780,7 +789,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             "mask_frame_image": payload.get("mask_frame_image", ""),
             "mask_sam_image": payload.get("mask_sam_image", ""),
             "used_mask_sam": bool(payload.get("used_mask_sam", False)),
-            "total_frames": int(payload.get("total_frames", payload.get("full_latents", torch.empty(0, 0)).shape[1] if "full_latents" in payload else SINGLETURN_TOTAL_FRAMES)),
+            "singleturn_sample_size": payload.get("singleturn_sample_size", []),
             "cache_mode": payload.get("mode", ""),
             "idx": 0,
         }
@@ -851,8 +860,11 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 }
 
             sample = {
-                "mask_frame_latent": batch["mask_frame_latent"],
+                "mask_sam_latent": batch["mask_sam_latent"],
+                "mask_check_latent": batch["mask_check_latent"],
                 "source_frame_latent": batch["source_frame_latent"],
+                "noisy_anchor_latent": batch["noisy_anchor_latent"],
+                "target_latent": batch["target_latent"],
                 "cache_path": cache_path,
                 "source_image": _first_item(batch["source_image"]),
                 "bg_image": _first_item(batch["bg_image"]),
@@ -860,7 +872,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 "mask_frame_image": _first_item(batch["mask_frame_image"]),
                 "mask_sam_image": _first_item(batch["mask_sam_image"]),
                 "used_mask_sam": bool(_first_item(batch["used_mask_sam"])),
-                "total_frames": int(_first_item(batch["total_frames"])),
+                "singleturn_sample_size": _first_item(batch["singleturn_sample_size"]),
                 "cache_mode": _first_item(batch["cache_mode"]),
                 "idx": batch_index,
             }
@@ -893,9 +905,10 @@ def _run_singleturn_raw_folder_mode(
     weight_dtype: torch.dtype,
     default_prompt_cache: dict,
 ):
-    total_frames = _validate_singleturn_coarse_total_frames(
-        args.singleturn_total_frames,
-        source="--singleturn_total_frames",
+    total_frames = _resolve_singleturn_total_frames(
+        args.corruption_frame,
+        args.restoration_frame,
+        source="--corruption_frame/--restoration_frame",
     )
     local_rank, world_size = _get_distributed_context()
     all_samples, missing_summary = _discover_raw_folder_samples(
@@ -947,6 +960,8 @@ def _run_singleturn_raw_folder_mode(
             "resized_mask_path": resized_mask_path,
             "generated_video_path": "",
             "generated_last_frame_path": "",
+            "corruption_frame": args.corruption_frame,
+            "restoration_frame": args.restoration_frame,
             "singleturn_total_frames": total_frames,
             "status": "pending",
         }
@@ -964,7 +979,7 @@ def _run_singleturn_raw_folder_mode(
             with torch.no_grad():
                 coarse_generation = generate_singleturn_sample_from_latents(
                     pipeline=pipeline,
-                    mask_frame_latent=_encode_singleturn_frame_latent(pipeline, mask_frame_tensor, weight_dtype),
+                    mask_sam_latent=_encode_singleturn_frame_latent(pipeline, mask_frame_tensor, weight_dtype),
                     source_frame_latent=_encode_singleturn_frame_latent(pipeline, source_tensor, weight_dtype),
                     prompt_embeds=default_prompt_cache["prompt_embeds"],
                     prompt_seq_len=default_prompt_cache["prompt_seq_len"],
@@ -973,7 +988,8 @@ def _run_singleturn_raw_folder_mode(
                     num_inference_steps=args.num_inference_steps,
                     generator=sample_generator,
                     weight_dtype=weight_dtype,
-                    total_frames=total_frames,
+                    corruption_frame=args.corruption_frame,
+                    restoration_frame=args.restoration_frame,
                 )
                 final_generation = coarse_generation
                 if args.enable_refinement:
@@ -1080,17 +1096,23 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=4, help="GIF playback FPS.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Inference weight dtype.")
     parser.add_argument(
+        "--corruption_frame",
+        type=int,
+        default=2,
+        help="Number of interpolation frames inserted between source and noisy-anchor.",
+    )
+    parser.add_argument(
+        "--restoration_frame",
+        type=int,
+        default=14,
+        help="Number of interpolation frames inserted between noisy-anchor and target.",
+    )
+    parser.add_argument(
         "--video_format",
         type=str,
         default="gif",
         choices=["gif", "mp4"],
         help="Saved preview video format. mp4 uses H.264 via ffmpeg/imageio.",
-    )
-    parser.add_argument(
-        "--singleturn_total_frames",
-        type=int,
-        default=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
-        help="Coarse SingleTurn total frames for direct image mode. Allowed values: 11 or 21. Cached mode follows the cache payload.",
     )
     args = parser.parse_args()
 
@@ -1125,9 +1147,10 @@ def parse_args():
         raise ValueError("--enable_refinement requires --refinement_lora_path.")
     if (not args.enable_refinement) and args.refinement_lora_path is not None:
         raise ValueError("--refinement_lora_path requires --enable_refinement.")
-    args.singleturn_total_frames = _validate_singleturn_coarse_total_frames(
-        args.singleturn_total_frames,
-        source="--singleturn_total_frames",
+    _resolve_singleturn_total_frames(
+        args.corruption_frame,
+        args.restoration_frame,
+        source="--corruption_frame/--restoration_frame",
     )
 
     args.sample_size = normalize_singleturn_sample_size(args.sample_size)
