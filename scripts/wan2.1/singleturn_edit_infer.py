@@ -766,7 +766,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             )
         missing = [
             key
-            for key in ("mask_sam_latent", "mask_check_latent", "source_frame_latent", "noisy_anchor_latent", "target_latent")
+            for key in ("mask_sam_latent", "source_frame_latent", "noisy_anchor_latent", "target_latent")
             if key not in payload
         ]
         if missing:
@@ -778,7 +778,6 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
 
         sample = {
             "mask_sam_latent": payload["mask_sam_latent"],
-            "mask_check_latent": payload["mask_check_latent"],
             "source_frame_latent": payload["source_frame_latent"],
             "noisy_anchor_latent": payload["noisy_anchor_latent"],
             "target_latent": payload["target_latent"],
@@ -861,7 +860,6 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
 
             sample = {
                 "mask_sam_latent": batch["mask_sam_latent"],
-                "mask_check_latent": batch["mask_check_latent"],
                 "source_frame_latent": batch["source_frame_latent"],
                 "noisy_anchor_latent": batch["noisy_anchor_latent"],
                 "target_latent": batch["target_latent"],

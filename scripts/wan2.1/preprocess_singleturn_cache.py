@@ -29,7 +29,6 @@ from videox_fun.utils.singleturn_utils import (
     SINGLETURN_OBJECT_REMOVAL_CACHE_MODE,
     build_singleturn_noisy_anchor_latents,
     normalize_singleturn_sample_size,
-    preprocess_singleturn_mask_frame,
 )
 
 
@@ -214,8 +213,6 @@ def _resolve_shared_prompt_cache_source(source_root: Path, source_metadata: dict
 
 def _extract_legacy_keyframe_latents(
     payload: dict,
-    *,
-    duplicate_mask_frame_for_both_masks: bool = False,
 ) -> dict[str, torch.Tensor]:
     full_latents = payload.get("full_latents")
     if not torch.is_tensor(full_latents) or full_latents.ndim != 4:
@@ -251,8 +248,6 @@ def _extract_legacy_keyframe_latents(
         "noisy_anchor_latent": full_latents[:, noisy_anchor_frame_index : noisy_anchor_frame_index + 1].detach().cpu(),
         "target_latent": full_latents[:, -1:].detach().cpu(),
     }
-    if duplicate_mask_frame_for_both_masks:
-        result["mask_check_latent"] = mask_sam_latent.detach().cpu()
     return result
 
 
@@ -290,7 +285,6 @@ def _build_conversion_record(
     global_index = _parse_global_index(entry.get("global_index"), Path(str(entry.get("cache_path", ""))).name)
     latents = _extract_legacy_keyframe_latents(
         payload,
-        duplicate_mask_frame_for_both_masks=duplicate_mask_frame_for_both_masks,
     )
 
     record = {
@@ -306,15 +300,6 @@ def _build_conversion_record(
         "used_mask_sam": bool(payload.get("used_mask_sam", entry.get("used_mask_sam", False))),
         "global_index": global_index,
     }
-    if duplicate_mask_frame_for_both_masks:
-        record["mask_check_latent"] = latents["mask_check_latent"]
-    else:
-        record["pixel_values_mask_check_frame"] = preprocess_singleturn_mask_frame(
-            mask_check_image,
-            sample_size,
-            add_batch_dim=False,
-            add_frame_dim=True,
-        )
     return record
 
 
@@ -348,11 +333,6 @@ def _flush_batch(
         dtype=weight_dtype,
         non_blocking=True,
     )
-    mask_check_frame_batch = _stack_batch_tensors(batch_records, "pixel_values_mask_check_frame").to(
-        device=device,
-        dtype=weight_dtype,
-        non_blocking=True,
-    )
     bg_batch = _stack_batch_tensors(batch_records, "pixel_values_tgt_image").to(
         device=device,
         dtype=weight_dtype,
@@ -366,7 +346,6 @@ def _flush_batch(
 
     with torch.no_grad():
         mask_sam_latents = vae.encode(mask_sam_batch.permute(0, 2, 1, 3, 4))[0].mode()
-        mask_check_latents = vae.encode(mask_check_frame_batch.permute(0, 2, 1, 3, 4))[0].mode()
         source_frame_latents = vae.encode(source_batch.permute(0, 2, 1, 3, 4))[0].mode()
         noisy_anchor_latents = build_singleturn_noisy_anchor_latents(
             source_frame_latents,
@@ -383,7 +362,6 @@ def _flush_batch(
             "mode": SINGLETURN_OBJECT_REMOVAL_CACHE_MODE,
             "dataset_type": "corne_object_removal",
             "mask_sam_latent": mask_sam_latents[local_offset].detach().cpu().to(weight_dtype),
-            "mask_check_latent": mask_check_latents[local_offset].detach().cpu().to(weight_dtype),
             "source_frame_latent": source_frame_latents[local_offset].detach().cpu().to(weight_dtype),
             "noisy_anchor_latent": noisy_anchor_latents[local_offset].detach().cpu().to(weight_dtype),
             "target_latent": target_latents[local_offset].detach().cpu().to(weight_dtype),
@@ -419,21 +397,8 @@ def _flush_conversion_batch(
 ) -> int:
     if not batch_records:
         return 0
-
-    if "mask_check_latent" in batch_records[0]:
-        mask_check_latents = _stack_batch_tensors(batch_records, "mask_check_latent").to(
-            device=device,
-            dtype=weight_dtype,
-            non_blocking=True,
-        )
-    else:
-        mask_check_frame_batch = _stack_batch_tensors(batch_records, "pixel_values_mask_check_frame").to(
-            device=device,
-            dtype=weight_dtype,
-            non_blocking=True,
-        )
-        with torch.no_grad():
-            mask_check_latents = vae.encode(mask_check_frame_batch.permute(0, 2, 1, 3, 4))[0].mode()
+    del device
+    del vae
 
     for local_offset, record in enumerate(batch_records):
         cache_path = cache_dir / build_cache_name(int(record["global_index"]), record["source_image"])
@@ -444,7 +409,6 @@ def _flush_conversion_batch(
             "mode": SINGLETURN_OBJECT_REMOVAL_CACHE_MODE,
             "dataset_type": "corne_object_removal",
             "mask_sam_latent": record["mask_sam_latent"].to(dtype=weight_dtype),
-            "mask_check_latent": mask_check_latents[local_offset].detach().cpu().to(weight_dtype),
             "source_frame_latent": record["source_frame_latent"].to(dtype=weight_dtype),
             "noisy_anchor_latent": record["noisy_anchor_latent"].to(dtype=weight_dtype),
             "target_latent": record["target_latent"].to(dtype=weight_dtype),

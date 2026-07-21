@@ -482,7 +482,6 @@ class CachedSingleTurnLatentDataset(Dataset):
                 key
                 for key in (
                     "mask_sam_latent",
-                    "mask_check_latent",
                     "source_frame_latent",
                     "noisy_anchor_latent",
                     "target_latent",
@@ -494,7 +493,6 @@ class CachedSingleTurnLatentDataset(Dataset):
             sample.update(
                 {
                     "mask_sam_latent": payload["mask_sam_latent"],
-                    "mask_check_latent": payload["mask_check_latent"],
                     "source_frame_latent": payload["source_frame_latent"],
                     "noisy_anchor_latent": payload["noisy_anchor_latent"],
                     "target_latent": payload["target_latent"],

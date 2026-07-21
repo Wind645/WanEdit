@@ -22,7 +22,7 @@ SINGLETURN_OBJECT_REMOVAL_MODE_TO_TOTAL_FRAMES = {
     "singleturn_object_removal_v4_tail_interp21": 21,
 }
 SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 2
-SINGLETURN_COARSE_FROZEN_FRAME_INDICES = (0, 2)
+SINGLETURN_COARSE_FROZEN_FRAME_INDICES = (0, 1)
 SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES = 5
 SINGLETURN_TAIL_TRAJECTORY_PREFIX_FRAMES = 8
 SINGLETURN_TAIL_START = 2
@@ -258,7 +258,7 @@ def compute_singleturn_object_removal_total_frames(
         raise ValueError(f"corruption_frame must be >= 0, got {corruption_frame}")
     if restoration_frame < 0:
         raise ValueError(f"restoration_frame must be >= 0, got {restoration_frame}")
-    return corruption_frame + restoration_frame + 5
+    return corruption_frame + restoration_frame + 4
 
 
 def load_singleturn_video_frames(
@@ -412,7 +412,6 @@ def resize_singleturn_mask_to_latent_grid(mask: torch.Tensor, latent: torch.Tens
 
 def build_singleturn_object_removal_latents(
     mask_sam_latent: torch.Tensor,
-    mask_check_latent: torch.Tensor,
     source_frame_latent: torch.Tensor,
     noisy_anchor_latent: torch.Tensor,
     target_latent: torch.Tensor,
@@ -421,19 +420,16 @@ def build_singleturn_object_removal_latents(
     restoration_frame: int,
 ) -> torch.Tensor:
     mask_sam_latent = _normalize_singleturn_prefix_latent("mask_sam_latent", mask_sam_latent)
-    mask_check_latent = _normalize_singleturn_prefix_latent("mask_check_latent", mask_check_latent)
     source_frame_latent = _normalize_singleturn_prefix_latent("source_frame_latent", source_frame_latent)
     noisy_anchor_latent = _normalize_singleturn_prefix_latent("noisy_anchor_latent", noisy_anchor_latent)
     target_latent = _normalize_singleturn_prefix_latent("target_latent", target_latent)
 
     _ensure_matching_shapes(source_frame_latent, mask_sam_latent, "mask_sam_latent")
-    _ensure_matching_shapes(source_frame_latent, mask_check_latent, "mask_check_latent")
     _ensure_matching_shapes(source_frame_latent, noisy_anchor_latent, "noisy_anchor_latent")
     _ensure_matching_shapes(source_frame_latent, target_latent, "target_latent")
 
     frames = [
         mask_sam_latent,
-        mask_check_latent,
         source_frame_latent,
     ]
     corruption_frame = int(corruption_frame)
@@ -499,8 +495,33 @@ def build_singleturn_inference_latents(
         generator=generator,
     )
     latents[:, :, 0:1] = mask_sam_latent.to(device=latents.device, dtype=dtype)
-    latents[:, :, 2:3] = source_frame_latent.to(device=latents.device, dtype=dtype)
+    latents[:, :, 1:2] = source_frame_latent.to(device=latents.device, dtype=dtype)
     return latents
+
+
+def build_singleturn_coarse_loss_weight_map(
+    latents: torch.Tensor,
+    *,
+    frozen_frame_indices: Sequence[int] = SINGLETURN_COARSE_FROZEN_FRAME_INDICES,
+    final_frame_weight: float = 1.0,
+) -> torch.Tensor:
+    if latents.ndim != 5:
+        raise ValueError(f"latents must have shape (B, C, T, H, W), got {tuple(latents.shape)}")
+    if final_frame_weight < 0.0:
+        raise ValueError(f"final_frame_weight must be >= 0.0, got {final_frame_weight}")
+
+    weight_map = torch.ones_like(latents)
+    normalized_frozen_indices = _normalize_singleturn_frozen_frame_indices(
+        frozen_frame_indices,
+        total_frames=latents.shape[2],
+    )
+    for frame_index in normalized_frozen_indices:
+        weight_map[:, :, frame_index : frame_index + 1] = 0
+    weight_map[:, :, -1:] = final_frame_weight
+    for frame_index in normalized_frozen_indices:
+        if frame_index == latents.shape[2] - 1:
+            weight_map[:, :, frame_index : frame_index + 1] = 0
+    return weight_map
 
 
 def build_singleturn_edge_weight_map(
@@ -839,7 +860,7 @@ def compute_singleturn_masked_mse_loss(
         effective_weights = effective_weights * loss_mask.float()
     if weighting is not None:
         effective_weights = effective_weights * weighting.float()
-    return (mse_loss * effective_weights).sum() / effective_weights.sum().clamp_min(1.0)
+    return (mse_loss * effective_weights).mean()
 
 
 def zero_singleturn_prefix_prediction(

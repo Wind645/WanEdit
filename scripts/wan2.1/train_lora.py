@@ -97,6 +97,7 @@ from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import create_network, merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
                                                SINGLETURN_COARSE_FROZEN_FRAME_INDICES,
+                                               build_singleturn_coarse_loss_weight_map,
                                                build_singleturn_noisy_anchor_latents,
                                                build_singleturn_object_removal_latents,
                                                compute_singleturn_masked_mse_loss,
@@ -276,7 +277,6 @@ def load_cached_singleturn_batch(
             raise ValueError("Cached SingleTurn coarse loading requires corruption_frame and restoration_frame.")
         full_latents = build_singleturn_object_removal_latents(
             mask_sam_latent=batch["mask_sam_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
-            mask_check_latent=batch["mask_check_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
             source_frame_latent=batch["source_frame_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
             noisy_anchor_latent=batch["noisy_anchor_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
             target_latent=batch["target_latent"].to(device=device, dtype=weight_dtype, non_blocking=True),
@@ -2257,7 +2257,6 @@ def main():
                     if args.singleturn_mode:
                         src_pixel_values = batch["pixel_values_src_image"].to(weight_dtype)
                         mask_sam_pixel_values = batch["pixel_values_mask_frame"].to(weight_dtype)
-                        mask_check_frame_pixel_values = batch["pixel_values_mask_check_frame"].to(weight_dtype)
                         tgt_pixel_values = batch["pixel_values_tgt_image"].to(weight_dtype)
                         mask_check_pixel_values = batch["pixel_values_mask_check"].to(weight_dtype)
                         batch_texts = [CORNE_SINGLETURN_PROMPT] * src_pixel_values.shape[0]
@@ -2406,7 +2405,6 @@ def main():
                                     pass
                         if args.singleturn_mode:
                             mask_sam_latents = _batch_encode_vae(mask_sam_pixel_values, use_mode=True)
-                            mask_check_latents = _batch_encode_vae(mask_check_frame_pixel_values, use_mode=True)
                             source_latents = _batch_encode_vae(src_pixel_values, use_mode=True)
                             target_latents = _batch_encode_vae(tgt_pixel_values, use_mode=True)
                             noisy_anchor_latents = build_singleturn_noisy_anchor_latents(
@@ -2416,7 +2414,6 @@ def main():
                             )
                             latents = build_singleturn_object_removal_latents(
                                 mask_sam_latent=mask_sam_latents,
-                                mask_check_latent=mask_check_latents,
                                 source_frame_latent=source_latents,
                                 noisy_anchor_latent=noisy_anchor_latents,
                                 target_latent=target_latents,
@@ -2557,6 +2554,10 @@ def main():
                             sigmas,
                             frozen_frame_indices=SINGLETURN_COARSE_FROZEN_FRAME_INDICES,
                         )
+                        singleturn_coarse_loss_weight_map = build_singleturn_coarse_loss_weight_map(
+                            latents,
+                            frozen_frame_indices=SINGLETURN_COARSE_FROZEN_FRAME_INDICES,
+                        )
                     else:
                         noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
@@ -2608,7 +2609,7 @@ def main():
                         loss = compute_singleturn_masked_mse_loss(
                             noise_pred.float(),
                             target.float(),
-                            weighting=weighting.float(),
+                            weighting=(weighting.float() * singleturn_coarse_loss_weight_map.float()),
                             loss_mask=singleturn_loss_mask.float(),
                         )
                     elif args.video_edit_loss_on_edited_frames_only:
