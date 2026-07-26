@@ -339,6 +339,8 @@ class CachedSingleTurnLatentDataset(Dataset):
         manifest_path: str,
         data_root: Optional[str] = None,
         expected_mode: str = "singleturn_object_removal_cached",
+        corruption_frames: int = 2,
+        restoration_frames: int = 5,
     ):
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
@@ -347,6 +349,8 @@ class CachedSingleTurnLatentDataset(Dataset):
         self.data_root = data_root
         self.manifest = manifest
         self.expected_mode = expected_mode
+        self.corruption_frames = int(corruption_frames)
+        self.restoration_frames = int(restoration_frames)
         self._shared_prompt_cache_payloads: Dict[str, Dict[str, Any]] = {}
 
     def __len__(self) -> int:
@@ -370,6 +374,38 @@ class CachedSingleTurnLatentDataset(Dataset):
         self._shared_prompt_cache_payloads[resolved_path] = payload
         return payload
 
+    def _build_full_latents_from_keyframes(
+        self,
+        mask_frame_latent: torch.Tensor,
+        source_frame_latent: torch.Tensor,
+        noisy_anchor_latent: torch.Tensor,
+        target_latent: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.corruption_frames < 0 or self.restoration_frames < 0:
+            raise ValueError("corruption_frames and restoration_frames must be non-negative.")
+        if not (
+            mask_frame_latent.shape
+            == source_frame_latent.shape
+            == noisy_anchor_latent.shape
+            == target_latent.shape
+        ):
+            raise ValueError(
+                "SingleTurn keyframe latents must share shape, got "
+                f"mask={tuple(mask_frame_latent.shape)}, source={tuple(source_frame_latent.shape)}, "
+                f"noisy_anchor={tuple(noisy_anchor_latent.shape)}, target={tuple(target_latent.shape)}."
+            )
+
+        frames = [mask_frame_latent, source_frame_latent]
+        for frame_idx in range(1, self.corruption_frames + 1):
+            alpha = float(frame_idx) / float(self.corruption_frames + 1)
+            frames.append((1.0 - alpha) * source_frame_latent + alpha * noisy_anchor_latent)
+        frames.append(noisy_anchor_latent)
+        for frame_idx in range(1, self.restoration_frames + 1):
+            alpha = float(frame_idx) / float(self.restoration_frames + 1)
+            frames.append((1.0 - alpha) * noisy_anchor_latent + alpha * target_latent)
+        frames.append(target_latent)
+        return torch.cat(frames, dim=-3)
+
     def __getitem__(self, index: int):
         entry = self.manifest[index]
         cache_path = self._resolve_cache_path(entry["cache_path"])
@@ -383,7 +419,7 @@ class CachedSingleTurnLatentDataset(Dataset):
 
         payload_mode = payload.get("mode")
         if self.expected_mode == "singleturn_object_removal_cached":
-            mode_matches = is_supported_singleturn_object_removal_mode(payload_mode)
+            mode_matches = is_supported_singleturn_object_removal_mode(payload_mode) or payload_mode == "singleturn_object_removal_sam_strict_keyframe_cache_v1"
         else:
             mode_matches = payload_mode == self.expected_mode
         if not mode_matches:
@@ -427,29 +463,41 @@ class CachedSingleTurnLatentDataset(Dataset):
             "idx": index,
         }
         if self.expected_mode == "singleturn_object_removal_cached" or is_supported_singleturn_object_removal_mode(self.expected_mode):
-            missing = [
-                key
-                for key in ("full_latents", "mask_frame_latent", "source_frame_latent", "edge_weight_map")
-                if key not in payload
-            ]
+            mask_frame_latent = payload.get("mask_frame_latent", payload.get("mask_check_latent"))
+            full_latents = payload.get("full_latents")
+            required_keys = ("source_frame_latent",)
+            if full_latents is None:
+                required_keys = ("source_frame_latent", "noisy_anchor_latent", "target_latent")
+            missing = [key for key in required_keys if key not in payload]
+            if mask_frame_latent is None:
+                missing.append("mask_frame_latent")
             if missing:
                 raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}")
-            total_frames = int(payload.get("total_frames", payload["full_latents"].shape[-3]))
-            if payload["full_latents"].shape[-3] != total_frames:
+            if full_latents is None:
+                full_latents = self._build_full_latents_from_keyframes(
+                    mask_frame_latent=mask_frame_latent,
+                    source_frame_latent=payload["source_frame_latent"],
+                    noisy_anchor_latent=payload["noisy_anchor_latent"],
+                    target_latent=payload["target_latent"],
+                )
+            payload_total_frames = payload.get("total_frames")
+            total_frames = int(payload_total_frames) if payload_total_frames is not None else int(full_latents.shape[-3])
+            if full_latents.shape[-3] != total_frames:
                 raise ValueError(
-                    f"Cached SingleTurn sample {cache_path} has {payload['full_latents'].shape[-3]} frames; "
+                    f"Cached SingleTurn sample {cache_path} has {full_latents.shape[-3]} frames; "
                     f"expected {total_frames}."
                 )
             sample.update(
                 {
-                    "full_latents": payload["full_latents"],
-                    "mask_frame_latent": payload["mask_frame_latent"],
+                    "full_latents": full_latents,
+                    "mask_frame_latent": mask_frame_latent,
                     "source_frame_latent": payload["source_frame_latent"],
-                    "edge_weight_map": payload["edge_weight_map"],
                     "total_frames": total_frames,
                     "cache_mode": payload_mode,
                 }
             )
+            if "edge_weight_map" in payload:
+                sample["edge_weight_map"] = payload["edge_weight_map"]
             return sample
 
         if self.expected_mode == "singleturn_object_removal_refine_v1":

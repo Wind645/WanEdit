@@ -1036,6 +1036,18 @@ def parse_args():
         help="Optional non-square sample size for SingleTurn mode only.",
     )
     parser.add_argument(
+        "--singleturn_cache_corruption_frames",
+        type=int,
+        default=2,
+        help="Number of interpolated frames between source and noisy anchor when cached full_latents are absent.",
+    )
+    parser.add_argument(
+        "--singleturn_cache_restoration_frames",
+        type=int,
+        default=5,
+        help="Number of interpolated frames between noisy anchor and target when cached full_latents are absent.",
+    )
+    parser.add_argument(
         "--singleturn_validation_image_path",
         type=str,
         default=None,
@@ -1675,6 +1687,8 @@ def main():
                 args.cached_data_meta,
                 args.cached_data_dir,
                 expected_mode=expected_mode,
+                corruption_frames=args.singleturn_cache_corruption_frames,
+                restoration_frames=args.singleturn_cache_restoration_frames,
             )
         else:
             train_dataset = CachedVideoLatentDataset(args.cached_data_meta, args.cached_data_dir)
@@ -2517,11 +2531,11 @@ def main():
                                 use_dynamic_singleturn_tail_start = True
 
                         if use_dynamic_singleturn_tail_start:
-                            singleturn_supervised_start_frames = torch.randint(
-                                3,
-                                SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES + 1,
+                            singleturn_supervised_start_frames = torch.full(
                                 (latents.shape[0],),
+                                3,
                                 device=latents.device,
+                                dtype=torch.long,
                             )
                         noisy_latents, target, singleturn_loss_mask = prepare_singleturn_noisy_latents(
                             latents,

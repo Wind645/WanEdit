@@ -1,30 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export MODEL_NAME=${MODEL_NAME:-models/Wan2.1-T2V-1.3B}
+export MODEL_NAME=${MODEL_NAME:-/mnt/cpfs/jiachengliu/pretrained_models/Wan-AI/Wan2.1-T2V-1.3B}
 export IMAGE_PATH=${IMAGE_PATH:-}
 export MASK_PATH=${MASK_PATH:-}
 export PROMPT=${PROMPT:-}
 export CACHED_SAMPLE_PATH=${CACHED_SAMPLE_PATH:-}
-export CACHED_DATA_META=${CACHED_DATA_META:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix/manifest.json}
-export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/home/data/nas_hdd/CORNE_extracted/cache/singleturn_object_removal_wan2.1_1.3b_v3_twoprefix}
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1}
+export CACHED_DATA_META=${CACHED_DATA_META:-${CACHED_DATA_DIR}/manifest.json}
 export SHARED_PROMPT_CACHE=${SHARED_PROMPT_CACHE:-}
 export CACHED_START_INDEX=${CACHED_START_INDEX:-0}
-export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-}
+export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-16}
 export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/singleturn_object_removal_v3_twoprefix}
-export LORA_PATH=${LORA_PATH:-}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/oldcode_masknoise_ropealign}
+export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/oldcode_maskwithnoise_ropealign/checkpoint-2000/lora_diffusion_pytorch_model.safetensors}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
 export REFINEMENT_LORA_PATH=${REFINEMENT_LORA_PATH:-}
 export REFINEMENT_LORA_ALPHA=${REFINEMENT_LORA_ALPHA:-1.0}
 export REFINEMENT_GUIDANCE_SCALE=${REFINEMENT_GUIDANCE_SCALE:-1.0}
 
-NPROC_PER_NODE=${NPROC_PER_NODE:-1}
+NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-50}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-5.0}
 SAMPLE_HEIGHT=${SAMPLE_HEIGHT:-${SAMPLE_SIZE:-480}}
 SAMPLE_WIDTH=${SAMPLE_WIDTH:-${SAMPLE_SIZE:-832}}
+SINGLETURN_CACHE_CORRUPTION_FRAMES=${SINGLETURN_CACHE_CORRUPTION_FRAMES:-2}
+SINGLETURN_CACHE_RESTORATION_FRAMES=${SINGLETURN_CACHE_RESTORATION_FRAMES:-5}
 SEED=${SEED:-0}
 FPS=${FPS:-4}
 DTYPE=${DTYPE:-bf16}
@@ -50,6 +53,8 @@ cmd_base=(
   --num_inference_steps "$NUM_INFERENCE_STEPS"
   --guidance_scale "$GUIDANCE_SCALE"
   --sample_size "$SAMPLE_HEIGHT" "$SAMPLE_WIDTH"
+  --singleturn_cache_corruption_frames "$SINGLETURN_CACHE_CORRUPTION_FRAMES"
+  --singleturn_cache_restoration_frames "$SINGLETURN_CACHE_RESTORATION_FRAMES"
   --seed "$SEED"
   --fps "$FPS"
   --dtype "$DTYPE"

@@ -471,7 +471,8 @@ def _run_singleturn_cached_sample(
                 pipeline = _restore_coarse_lora(pipeline, args, pipeline._execution_device, weight_dtype)
 
     preview_paths = {}
-    if sample.get("source_image") and mask_frame_path:
+    source_path = sample.get("source_image", "")
+    if sample.get("source_image") and mask_frame_path and os.path.exists(source_path) and os.path.exists(mask_frame_path):
         preview_paths = _save_singleturn_input_visuals(
             output_dir=output_dir,
             stem=stem,
@@ -542,21 +543,24 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 f"Cached SingleTurn sample {cache_path} uses the deprecated instructpix2pix posterior payload. "
                 "Re-run CORNE object-removal preprocess."
             )
-        if not is_supported_singleturn_object_removal_mode(payload.get("mode")):
+        payload_mode = payload.get("mode")
+        if not (is_supported_singleturn_object_removal_mode(payload_mode) or payload_mode == "singleturn_object_removal_sam_strict_keyframe_cache_v1"):
             raise ValueError(
-                f"Cached SingleTurn sample {cache_path} has unsupported mode={payload.get('mode')!r}. "
+                f"Cached SingleTurn sample {cache_path} has unsupported mode={payload_mode!r}. "
                 "Re-run CORNE object-removal preprocess / patch to generate a supported cache."
             )
-        missing = [key for key in ("mask_frame_latent", "source_frame_latent") if key not in payload]
+        mask_frame_latent = payload.get("mask_frame_latent", payload.get("mask_check_latent"))
+        missing = [key for key in ("source_frame_latent",) if key not in payload]
+        if mask_frame_latent is None:
+            missing.append("mask_frame_latent")
         if missing:
             raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}.")
-
         prompt_cache = shared_prompt_cache
         if args.shared_prompt_cache is None and payload.get("shared_prompt_cache") is not None:
             prompt_cache = _load_shared_prompt_cache(_resolve_cache_path(payload["shared_prompt_cache"], cached_data_dir))
 
         sample = {
-            "mask_frame_latent": payload["mask_frame_latent"],
+            "mask_frame_latent": mask_frame_latent,
             "source_frame_latent": payload["source_frame_latent"],
             "cache_path": cache_path,
             "source_image": payload.get("source_image", ""),
@@ -584,7 +588,12 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             )
         )
     else:
-        dataset = CachedSingleTurnLatentDataset(args.cached_data_meta, cached_data_dir)
+        dataset = CachedSingleTurnLatentDataset(
+            args.cached_data_meta,
+            cached_data_dir,
+            corruption_frames=args.singleturn_cache_corruption_frames,
+            restoration_frames=args.singleturn_cache_restoration_frames,
+        )
         start_index = max(0, int(args.cached_start_index))
         if start_index >= len(dataset):
             raise ValueError(
@@ -714,6 +723,18 @@ def parse_args():
         default=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
         help="Total latent frames used in direct image-mode SingleTurn inference. Cached mode ignores this and follows the cache payload.",
     )
+    parser.add_argument(
+        "--singleturn_cache_corruption_frames",
+        type=int,
+        default=2,
+        help="Number of interpolated frames between source and noisy anchor in the cached layout.",
+    )
+    parser.add_argument(
+        "--singleturn_cache_restoration_frames",
+        type=int,
+        default=5,
+        help="Number of interpolated frames between noisy anchor and target in the cached layout.",
+    )
     args = parser.parse_args()
 
     cache_mode = args.cached_sample_path is not None or args.cached_data_meta is not None
@@ -739,6 +760,8 @@ def parse_args():
         raise ValueError("--refinement_lora_path requires --enable_refinement.")
     if args.singleturn_total_frames < 8:
         raise ValueError(f"--singleturn_total_frames must be >= 8, got {args.singleturn_total_frames}.")
+    if args.singleturn_cache_corruption_frames < 0 or args.singleturn_cache_restoration_frames < 0:
+        raise ValueError("--singleturn_cache_corruption_frames and --singleturn_cache_restoration_frames must be non-negative.")
 
     args.sample_size = normalize_singleturn_sample_size(args.sample_size)
     if any(dim % 16 != 0 for dim in args.sample_size):
