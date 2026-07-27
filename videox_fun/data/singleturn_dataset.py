@@ -10,6 +10,8 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
+    SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES,
+    SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
     is_supported_singleturn_object_removal_mode,
     normalize_singleturn_sample_size,
     preprocess_singleturn_image,
@@ -339,8 +341,10 @@ class CachedSingleTurnLatentDataset(Dataset):
         manifest_path: str,
         data_root: Optional[str] = None,
         expected_mode: str = "singleturn_object_removal_cached",
-        corruption_frames: int = 2,
-        restoration_frames: int = 5,
+        corruption_frames: int = SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES,
+        restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
+        interpolation_gamma: float = 2.0,
+        random_mask_frame_latent: bool = False,
     ):
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
@@ -351,6 +355,8 @@ class CachedSingleTurnLatentDataset(Dataset):
         self.expected_mode = expected_mode
         self.corruption_frames = int(corruption_frames)
         self.restoration_frames = int(restoration_frames)
+        self.interpolation_gamma = float(interpolation_gamma)
+        self.random_mask_frame_latent = bool(random_mask_frame_latent)
         self._shared_prompt_cache_payloads: Dict[str, Dict[str, Any]] = {}
 
     def __len__(self) -> int:
@@ -377,6 +383,7 @@ class CachedSingleTurnLatentDataset(Dataset):
     def _build_full_latents_from_keyframes(
         self,
         mask_frame_latent: torch.Tensor,
+        mask_check_frame_latent: torch.Tensor,
         source_frame_latent: torch.Tensor,
         noisy_anchor_latent: torch.Tensor,
         target_latent: torch.Tensor,
@@ -385,23 +392,25 @@ class CachedSingleTurnLatentDataset(Dataset):
             raise ValueError("corruption_frames and restoration_frames must be non-negative.")
         if not (
             mask_frame_latent.shape
+            == mask_check_frame_latent.shape
             == source_frame_latent.shape
             == noisy_anchor_latent.shape
             == target_latent.shape
         ):
             raise ValueError(
                 "SingleTurn keyframe latents must share shape, got "
-                f"mask={tuple(mask_frame_latent.shape)}, source={tuple(source_frame_latent.shape)}, "
+                f"mask={tuple(mask_frame_latent.shape)}, mask_check={tuple(mask_check_frame_latent.shape)}, source={tuple(source_frame_latent.shape)}, "
                 f"noisy_anchor={tuple(noisy_anchor_latent.shape)}, target={tuple(target_latent.shape)}."
             )
 
-        frames = [mask_frame_latent, source_frame_latent]
+        frames = [mask_frame_latent, mask_check_frame_latent, source_frame_latent]
         for frame_idx in range(1, self.corruption_frames + 1):
-            alpha = float(frame_idx) / float(self.corruption_frames + 1)
+            alpha = (float(frame_idx) / float(self.corruption_frames + 1)) ** self.interpolation_gamma
             frames.append((1.0 - alpha) * source_frame_latent + alpha * noisy_anchor_latent)
         frames.append(noisy_anchor_latent)
         for frame_idx in range(1, self.restoration_frames + 1):
-            alpha = float(frame_idx) / float(self.restoration_frames + 1)
+            progress = float(frame_idx) / float(self.restoration_frames + 1)
+            alpha = 1.0 - (1.0 - progress) ** self.interpolation_gamma
             frames.append((1.0 - alpha) * noisy_anchor_latent + alpha * target_latent)
         frames.append(target_latent)
         return torch.cat(frames, dim=-3)
@@ -463,11 +472,15 @@ class CachedSingleTurnLatentDataset(Dataset):
             "idx": index,
         }
         if self.expected_mode == "singleturn_object_removal_cached" or is_supported_singleturn_object_removal_mode(self.expected_mode):
-            mask_frame_latent = payload.get("mask_frame_latent", payload.get("mask_check_latent"))
+            mask_check_frame_latent = payload.get("mask_check_latent")
+            mask_sam_latent = payload.get("mask_sam_latent")
+            mask_frame_latent = payload.get("mask_frame_latent", mask_check_frame_latent)
+            if self.random_mask_frame_latent and mask_sam_latent is not None:
+                mask_frame_latent = mask_sam_latent if float(torch.rand((), device=mask_sam_latent.device).item()) < 0.5 else mask_check_frame_latent
             full_latents = payload.get("full_latents")
             required_keys = ("source_frame_latent",)
             if full_latents is None:
-                required_keys = ("source_frame_latent", "noisy_anchor_latent", "target_latent")
+                required_keys = ("mask_check_latent", "source_frame_latent", "noisy_anchor_latent", "target_latent")
             missing = [key for key in required_keys if key not in payload]
             if mask_frame_latent is None:
                 missing.append("mask_frame_latent")
@@ -476,6 +489,7 @@ class CachedSingleTurnLatentDataset(Dataset):
             if full_latents is None:
                 full_latents = self._build_full_latents_from_keyframes(
                     mask_frame_latent=mask_frame_latent,
+                    mask_check_frame_latent=mask_check_frame_latent,
                     source_frame_latent=payload["source_frame_latent"],
                     noisy_anchor_latent=payload["noisy_anchor_latent"],
                     target_latent=payload["target_latent"],

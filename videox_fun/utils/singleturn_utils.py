@@ -12,14 +12,32 @@ from videox_fun.utils.utils import save_videos_grid
 
 CORNE_SINGLETURN_PROMPT = "Remove the masked object and its side effect"
 SINGLETURN_TOTAL_FRAMES = 8
-SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES = 11
+SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES = 2
+SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES = 5
+SINGLETURN_MASK_CONDITION_FRAME_INDEX = 0
+SINGLETURN_MASK_PREDICTION_FRAME_INDEX = 1
+SINGLETURN_SOURCE_CONDITION_FRAME_INDEX = 2
+SINGLETURN_CONDITION_FRAME_INDICES = (
+    SINGLETURN_MASK_CONDITION_FRAME_INDEX,
+    SINGLETURN_SOURCE_CONDITION_FRAME_INDEX,
+)
+SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 1
+SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES = 5
+SINGLETURN_TAIL_START = SINGLETURN_SOURCE_CONDITION_FRAME_INDEX + 1
+
+
+def compute_singleturn_object_removal_total_frames(corruption_frames: int, restoration_frames: int) -> int:
+    return SINGLETURN_TAIL_START + int(corruption_frames) + 1 + int(restoration_frames) + 1
+
+
+SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES = compute_singleturn_object_removal_total_frames(
+    SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES,
+    SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
+)
 SINGLETURN_OBJECT_REMOVAL_MODE_TO_TOTAL_FRAMES = {
     "singleturn_object_removal_v2": 8,
     "singleturn_object_removal_v3_tail_interp11": 11,
 }
-SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 2
-SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES = 5
-SINGLETURN_TAIL_START = 2
 
 
 def format_singleturn_prompt(prompt: Optional[str] = None, prompt_template: Optional[str] = None) -> str:
@@ -271,6 +289,9 @@ def build_singleturn_object_removal_latents(
     noise_latent: Optional[torch.Tensor] = None,
     *,
     total_frames: int = SINGLETURN_TOTAL_FRAMES,
+    corruption_frames: int = SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES,
+    restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
+    interpolation_gamma: float = 2.0,
 ) -> torch.Tensor:
     _ensure_singleturn_latent_shape("mask_frame_latent", mask_frame_latent)
     _ensure_singleturn_latent_shape("source_frame_latent", source_frame_latent)
@@ -298,18 +319,25 @@ def build_singleturn_object_removal_latents(
     mask = mask_check_latent.to(dtype=torch.bool).expand_as(source_frame_latent)
     noisy_anchor = torch.where(mask, noise_latent, source_frame_latent)
 
-    if total_frames < 8:
-        raise ValueError(f"total_frames must be >= 8 for SingleTurn object removal, got {total_frames}")
-    tail_interp_steps = total_frames - 5
+    expected_total_frames = compute_singleturn_object_removal_total_frames(corruption_frames, restoration_frames)
+    if total_frames != expected_total_frames:
+        raise ValueError(
+            f"total_frames must equal corruption/restoration layout size {expected_total_frames}, got {total_frames}"
+        )
     frames = [
         mask_frame_latent,
+        mask_frame_latent,
         source_frame_latent,
-        _interp(source_frame_latent, noisy_anchor, 1.0 / 3.0),
-        _interp(source_frame_latent, noisy_anchor, 2.0 / 3.0),
-        noisy_anchor,
     ]
-    for step_idx in range(1, tail_interp_steps + 1):
-        frames.append(_interp(noisy_anchor, bg_latent, float(step_idx) / float(tail_interp_steps)))
+    for frame_idx in range(1, int(corruption_frames) + 1):
+        alpha = (float(frame_idx) / float(int(corruption_frames) + 1)) ** float(interpolation_gamma)
+        frames.append(_interp(source_frame_latent, noisy_anchor, alpha))
+    frames.append(noisy_anchor)
+    for frame_idx in range(1, int(restoration_frames) + 1):
+        progress = float(frame_idx) / float(int(restoration_frames) + 1)
+        alpha = 1.0 - (1.0 - progress) ** float(interpolation_gamma)
+        frames.append(_interp(noisy_anchor, bg_latent, alpha))
+    frames.append(bg_latent)
     return torch.cat(frames, dim=2)
 
 
@@ -354,17 +382,20 @@ def build_singleturn_edge_weight_map(
 
 def build_singleturn_prefix_inference_latents(
     mask_frame_latent: torch.Tensor,
+    middle_frame_latent: torch.Tensor,
     source_frame_latent: torch.Tensor,
     tail_noise: torch.Tensor,
     *,
     total_frames: int = SINGLETURN_TOTAL_FRAMES,
 ) -> torch.Tensor:
     _ensure_singleturn_latent_shape("mask_frame_latent", mask_frame_latent)
+    _ensure_singleturn_latent_shape("middle_frame_latent", middle_frame_latent)
     _ensure_singleturn_latent_shape("source_frame_latent", source_frame_latent)
     _ensure_matching_shapes(source_frame_latent, mask_frame_latent, "mask_frame_latent")
+    _ensure_matching_shapes(source_frame_latent, middle_frame_latent, "middle_frame_latent")
     if tail_noise.ndim != 5:
         raise ValueError(f"tail_noise must have shape (B, C, T, H, W), got {tuple(tail_noise.shape)}")
-    expected_tail_frames = total_frames - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES
+    expected_tail_frames = total_frames - SINGLETURN_TAIL_START
     if tail_noise.shape[2] != expected_tail_frames:
         raise ValueError(
             "tail_noise must contain exactly "
@@ -376,7 +407,7 @@ def build_singleturn_prefix_inference_latents(
             "tail_noise must match source_frame_latent batch/channel/spatial shape. "
             f"Got {tuple(source_frame_latent.shape)} and {tuple(tail_noise.shape)}."
         )
-    return torch.cat([mask_frame_latent, source_frame_latent, tail_noise], dim=2)
+    return torch.cat([mask_frame_latent, middle_frame_latent, source_frame_latent, tail_noise], dim=2)
 
 
 def build_singleturn_loss_mask_like(
@@ -670,7 +701,7 @@ def _run_singleturn_generation(
         (
             source_frame_latent.shape[0],
             source_frame_latent.shape[1],
-            total_frames - SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
+            total_frames - SINGLETURN_TAIL_START,
             source_frame_latent.shape[3],
             source_frame_latent.shape[4],
         ),
@@ -678,8 +709,15 @@ def _run_singleturn_generation(
         generator=generator,
         dtype=weight_dtype,
     )
+    middle_noise = torch.randn(
+        source_frame_latent.shape,
+        device=device,
+        generator=generator,
+        dtype=weight_dtype,
+    )
     latents = build_singleturn_prefix_inference_latents(
         mask_frame_latent,
+        middle_noise,
         source_frame_latent,
         tail_noise,
         total_frames=total_frames,
@@ -708,8 +746,10 @@ def _run_singleturn_generation(
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-        frozen_prefix = latents[:, :, :SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES].clone()
-        noise_pred = zero_singleturn_prefix_prediction(noise_pred)
+        condition_frame_indices = list(SINGLETURN_CONDITION_FRAME_INDICES)
+        frozen_condition = latents[:, :, condition_frame_indices].clone()
+        noise_pred = noise_pred.clone()
+        noise_pred[:, :, condition_frame_indices] = 0
         latents = pipeline.scheduler.step(
             noise_pred,
             timestep,
@@ -717,7 +757,8 @@ def _run_singleturn_generation(
             **extra_step_kwargs,
             return_dict=False,
         )[0]
-        latents = restore_singleturn_prefix(latents, frozen_prefix)
+        latents = latents.clone()
+        latents[:, :, condition_frame_indices] = frozen_condition
 
     full_frames = decode_singleturn_latent_frames(pipeline.vae, latents, decode_dtype=weight_dtype).cpu()
     tail_frames = full_frames[:, :, SINGLETURN_TAIL_START:].contiguous()

@@ -97,9 +97,9 @@ except ImportError:
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import create_network, merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
-                                               SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
                                                build_singleturn_object_removal_latents,
                                                build_singleturn_loss_mask_like,
+                                               compute_singleturn_object_removal_total_frames,
                                                compute_wan_seq_len_from_latents,
                                                generate_singleturn_sample,
                                                normalize_singleturn_sample_size,
@@ -108,6 +108,7 @@ from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
                                                preprocess_singleturn_mask_frame,
                                                resize_singleturn_mask_to_latent_grid,
                                                SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
+                                               SINGLETURN_SOURCE_CONDITION_FRAME_INDEX,
                                                save_singleturn_outputs)
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
 
@@ -404,7 +405,10 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                     num_inference_steps=args.singleturn_validation_num_inference_steps,
                     generator=generator,
                     weight_dtype=weight_dtype,
-                    total_frames=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+                    total_frames=compute_singleturn_object_removal_total_frames(
+                        args.singleturn_cache_corruption_frames,
+                        args.singleturn_cache_restoration_frames,
+                    ),
                 )
 
             output_paths = save_singleturn_outputs(
@@ -1048,6 +1052,12 @@ def parse_args():
         help="Number of interpolated frames between noisy anchor and target when cached full_latents are absent.",
     )
     parser.add_argument(
+        "--singleturn_cache_interpolation_gamma",
+        type=float,
+        default=2.0,
+        help="Gamma for non-linear interpolation when cached full_latents are absent.",
+    )
+    parser.add_argument(
         "--singleturn_validation_image_path",
         type=str,
         default=None,
@@ -1689,6 +1699,8 @@ def main():
                 expected_mode=expected_mode,
                 corruption_frames=args.singleturn_cache_corruption_frames,
                 restoration_frames=args.singleturn_cache_restoration_frames,
+                interpolation_gamma=args.singleturn_cache_interpolation_gamma,
+                random_mask_frame_latent=args.singleturn_mode,
             )
         else:
             train_dataset = CachedVideoLatentDataset(args.cached_data_meta, args.cached_data_dir)
@@ -2370,7 +2382,13 @@ def main():
                                 bg_latent=target_latents,
                                 mask_check_latent=latent_mask,
                                 noise_latent=noise_latents,
-                                total_frames=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+                                total_frames=compute_singleturn_object_removal_total_frames(
+                                    args.singleturn_cache_corruption_frames,
+                                    args.singleturn_cache_restoration_frames,
+                                ),
+                                corruption_frames=args.singleturn_cache_corruption_frames,
+                                restoration_frames=args.singleturn_cache_restoration_frames,
+                                interpolation_gamma=args.singleturn_cache_interpolation_gamma,
                             )
                         elif vae_stream_1 is not None:
                             vae_stream_1.wait_stream(torch.cuda.current_stream())
@@ -2500,14 +2518,18 @@ def main():
                 else:
                     sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                     if args.singleturn_mode:
+                        expected_singleturn_total_frames = compute_singleturn_object_removal_total_frames(
+                            args.singleturn_cache_corruption_frames,
+                            args.singleturn_cache_restoration_frames,
+                        )
                         use_dynamic_singleturn_tail_start = False
-                        if latents.shape[2] == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES:
+                        singleturn_source_condition_frame = None
+                        if latents.shape[2] == expected_singleturn_total_frames:
                             if use_cached_data:
                                 batch_total_frames = batch.get("total_frames")
-                                batch_cache_modes = batch.get("cache_mode")
                                 if isinstance(batch_total_frames, torch.Tensor):
                                     total_frames_match = bool(
-                                        (batch_total_frames == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES).all().item()
+                                        (batch_total_frames == expected_singleturn_total_frames).all().item()
                                     )
                                 else:
                                     total_frames_values = (
@@ -2516,33 +2538,30 @@ def main():
                                         else [int(batch_total_frames)]
                                     )
                                     total_frames_match = all(
-                                        value == SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES for value in total_frames_values
+                                        value == expected_singleturn_total_frames for value in total_frames_values
                                     )
-                                cache_modes = (
-                                    list(batch_cache_modes)
-                                    if isinstance(batch_cache_modes, (list, tuple))
-                                    else [batch_cache_modes]
-                                )
-                                cache_mode_match = all(
-                                    cache_mode == "singleturn_object_removal_v3_tail_interp11" for cache_mode in cache_modes
-                                )
-                                use_dynamic_singleturn_tail_start = total_frames_match and cache_mode_match
+                                use_dynamic_singleturn_tail_start = total_frames_match
                             else:
                                 use_dynamic_singleturn_tail_start = True
 
                         if use_dynamic_singleturn_tail_start:
                             singleturn_supervised_start_frames = torch.full(
                                 (latents.shape[0],),
-                                3,
+                                2,
                                 device=latents.device,
                                 dtype=torch.long,
                             )
+                            singleturn_source_condition_frame = SINGLETURN_SOURCE_CONDITION_FRAME_INDEX
                         noisy_latents, target, singleturn_loss_mask = prepare_singleturn_noisy_latents(
                             latents,
                             noise,
                             sigmas,
                             supervised_start_frames=singleturn_supervised_start_frames,
                         )
+                        if singleturn_source_condition_frame is not None and singleturn_source_condition_frame < latents.shape[2]:
+                            source_slice = slice(singleturn_source_condition_frame, singleturn_source_condition_frame + 1)
+                            noisy_latents[:, :, source_slice] = latents[:, :, source_slice]
+                            singleturn_loss_mask[:, :, source_slice] = 0
                         if (
                             singleturn_supervised_start_frames is not None
                             and args.debug_shapes
@@ -2562,9 +2581,14 @@ def main():
                                     int(frame): int(count)
                                     for frame, count in zip(sampled_hist_frames.tolist(), sampled_hist_counts.tolist())
                                 }
-                                supervised_frame_counts = (
-                                    SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES - sampled_start_frames + 1
-                                ).tolist()
+                                if singleturn_source_condition_frame is not None:
+                                    supervised_frame_counts = (
+                                        expected_singleturn_total_frames - sampled_start_frames
+                                    ).tolist()
+                                else:
+                                    supervised_frame_counts = (
+                                        expected_singleturn_total_frames - sampled_start_frames + 1
+                                    ).tolist()
                                 print(
                                     "[DEBUG] singleturn supervised_start_frames="
                                     f"{sampled_start_frames.tolist()} supervised_frame_counts={supervised_frame_counts} "

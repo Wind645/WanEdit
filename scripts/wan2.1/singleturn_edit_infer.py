@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from diffusers import FlowMatchEulerDiscreteScheduler
 from omegaconf import OmegaConf
 from PIL import Image
@@ -31,8 +32,8 @@ from videox_fun.pipeline import WanPipeline
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
-    SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
     SINGLETURN_TOTAL_FRAMES,
+    compute_singleturn_object_removal_total_frames,
     generate_singleturn_sample,
     generate_singleturn_sample_from_latents,
     is_supported_singleturn_object_removal_mode,
@@ -302,6 +303,52 @@ def _tensor_mask_to_pil(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="L")
 
 
+def _letterbox_geometry(width: int, height: int, sample_size: tuple[int, int]) -> tuple[int, int, int, int]:
+    target_height, target_width = sample_size
+    scale = min(target_width / float(width), target_height / float(height))
+    resized_width = max(1, int(round(width * scale)))
+    resized_height = max(1, int(round(height * scale)))
+    left = (target_width - resized_width) // 2
+    top = (target_height - resized_height) // 2
+    return resized_width, resized_height, left, top
+
+
+def _restore_generation_to_original_size(
+    generation: dict,
+    *,
+    original_size: tuple[int, int],
+    sample_size: tuple[int, int],
+) -> dict:
+    orig_width, orig_height = original_size
+    resized_width, resized_height, left, top = _letterbox_geometry(orig_width, orig_height, sample_size)
+    full_frames = generation["full_frames"]
+    tail_frames = generation["tail_frames"]
+
+    def restore(frames: torch.Tensor) -> torch.Tensor:
+        if frames.ndim != 5:
+            raise ValueError(f"Expected frames with shape (B, C, T, H, W), got {tuple(frames.shape)}")
+        frames = frames[..., top : top + resized_height, left : left + resized_width]
+        if resized_height == orig_height and resized_width == orig_width:
+            return frames
+        restored = []
+        for frame_idx in range(frames.shape[2]):
+            restored.append(
+                F.interpolate(
+                    frames[:, :, frame_idx],
+                    size=(orig_height, orig_width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            )
+        return torch.stack(restored, dim=2)
+
+    return {
+        **generation,
+        "full_frames": restore(full_frames),
+        "tail_frames": restore(tail_frames),
+    }
+
+
 def _save_singleturn_input_visuals(
     *,
     output_dir: str,
@@ -331,6 +378,74 @@ def _save_singleturn_input_visuals(
         "mask_frame_input_preview": mask_frame_output_path,
         "source_frame_input_preview": source_frame_output_path,
     }
+
+
+def _resolve_raw_image_dir(raw_data_dir: str) -> str:
+    for dirname in ("img", "images"):
+        path = os.path.join(raw_data_dir, dirname)
+        if os.path.isdir(path):
+            return path
+    raise FileNotFoundError(f"Missing raw image folder: expected img/ or images/ under {raw_data_dir}")
+
+
+def _resolve_raw_mask_dir(raw_data_dir: str) -> str:
+    for dirname in ("mask", "masks"):
+        path = os.path.join(raw_data_dir, dirname)
+        if os.path.isdir(path):
+            return path
+    raise FileNotFoundError(f"Missing raw mask folder: expected mask/ or masks/ under {raw_data_dir}")
+
+
+def _find_raw_file(root: str, rel_stem: str, suffixes: tuple[str, ...]) -> Optional[str]:
+    for suffix in suffixes:
+        path = os.path.join(root, f"{rel_stem}{suffix}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _load_raw_folder_triplets(raw_data_dir: str, raw_selected_triplets: Optional[str]) -> list[str]:
+    manifest_path = raw_selected_triplets or os.path.join(raw_data_dir, "selected_triplets.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            triplets = payload.get("selected_triplets")
+        else:
+            triplets = payload
+        if not isinstance(triplets, list) or not triplets:
+            raise ValueError(f"Invalid raw triplet manifest: {manifest_path}")
+        return [str(item) for item in triplets]
+
+    image_dir = _resolve_raw_image_dir(raw_data_dir)
+    suffixes = {".jpg", ".jpeg", ".png", ".webp"}
+    triplets = [
+        path.relative_to(image_dir).with_suffix("").as_posix()
+        for path in sorted(Path(image_dir).rglob("*"))
+        if path.is_file() and path.suffix.lower() in suffixes
+    ]
+    if not triplets:
+        raise ValueError(f"No raw images found under {image_dir}")
+    return triplets
+
+
+def _resolve_raw_folder_paths(raw_data_dir: str, rel_triplet: str) -> tuple[str, str, str]:
+    suffixes = (".jpg", ".jpeg", ".png", ".webp")
+    image_dir = _resolve_raw_image_dir(raw_data_dir)
+    mask_dir = _resolve_raw_mask_dir(raw_data_dir)
+    image_path = _find_raw_file(image_dir, rel_triplet, suffixes)
+    mask_path = _find_raw_file(mask_dir, rel_triplet, suffixes)
+    if mask_path is None:
+        mask_path = _find_raw_file(mask_dir, f"{rel_triplet}_M", suffixes)
+    gt_path = ""
+    gt_dir = os.path.join(raw_data_dir, "gt")
+    if os.path.isdir(gt_dir):
+        gt_path = _find_raw_file(gt_dir, rel_triplet, suffixes) or ""
+    if image_path is None or not os.path.exists(image_path):
+        raise FileNotFoundError(f"Missing raw image for triplet {rel_triplet}: expected image under {image_dir}")
+    if mask_path is None or not os.path.exists(mask_path):
+        raise FileNotFoundError(f"Missing raw mask for triplet {rel_triplet}: expected same stem or _M suffix under {mask_dir}")
+    return image_path, mask_path, gt_path
 
 
 def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
@@ -417,6 +532,146 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
         "refined_outputs": refined_output_paths,
         "metadata": metadata_path,
     }
+
+
+def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
+    local_rank, world_size = _get_distributed_context()
+    triplets = _load_raw_folder_triplets(args.raw_data_dir, args.raw_selected_triplets)
+    start_index = max(0, int(args.cached_start_index))
+    if start_index >= len(triplets):
+        raise ValueError(f"--cached_start_index {start_index} is out of range for raw dataset of length {len(triplets)}.")
+    end_index = len(triplets)
+    if args.cached_num_samples is not None:
+        if args.cached_num_samples <= 0:
+            raise ValueError("--cached_num_samples must be positive when provided.")
+        end_index = min(len(triplets), start_index + int(args.cached_num_samples))
+    indices = list(range(start_index, end_index))
+    if world_size > 1:
+        indices = indices[local_rank::world_size]
+        if not indices:
+            return {"outputs": [], "summary": None}
+
+    prompt_cache = _encode_fixed_prompt(pipeline.tokenizer, pipeline.text_encoder, pipeline._execution_device, weight_dtype)
+    results = []
+    for index in tqdm(indices, desc="Running raw folder SingleTurn inference"):
+        rel_triplet = triplets[index]
+        image_path, mask_path, gt_path = _resolve_raw_folder_paths(args.raw_data_dir, rel_triplet)
+        with Image.open(image_path) as image:
+            original_size = image.size
+
+        source_tensor = preprocess_singleturn_image(image_path, args.sample_size).to(
+            device=pipeline._execution_device,
+            dtype=weight_dtype,
+        )
+        mask_frame_tensor = preprocess_singleturn_mask_frame(mask_path, args.sample_size).to(
+            device=pipeline._execution_device,
+            dtype=weight_dtype,
+        )
+
+        with torch.no_grad():
+            coarse_generation = generate_singleturn_sample(
+                pipeline=pipeline,
+                mask_frame_tensor=mask_frame_tensor,
+                source_tensor=source_tensor,
+                negative_prompt=args.negative_prompt,
+                guidance_scale=args.guidance_scale,
+                num_inference_steps=args.num_inference_steps,
+                generator=generator,
+                weight_dtype=weight_dtype,
+                total_frames=args.singleturn_total_frames,
+            )
+            refined_generation = None
+            if args.enable_refinement:
+                if args.singleturn_total_frames != SINGLETURN_TOTAL_FRAMES:
+                    raise ValueError(
+                        "The current refinement stage only supports 8-frame coarse latents. "
+                        f"Got singleturn_total_frames={args.singleturn_total_frames}."
+                    )
+                pipeline = _enable_refinement_lora(pipeline, args, pipeline._execution_device, weight_dtype)
+                try:
+                    refined_generation = refine_singleturn_sample_from_latents(
+                        pipeline=pipeline,
+                        coarse_latents=coarse_generation["latents"],
+                        prompt_embeds=prompt_cache["prompt_embeds"],
+                        prompt_seq_len=prompt_cache["prompt_seq_len"],
+                        negative_prompt=args.negative_prompt,
+                        guidance_scale=args.refinement_guidance_scale,
+                        weight_dtype=weight_dtype,
+                    )
+                finally:
+                    pipeline = _restore_coarse_lora(pipeline, args, pipeline._execution_device, weight_dtype)
+
+        coarse_generation = _restore_generation_to_original_size(
+            coarse_generation,
+            original_size=original_size,
+            sample_size=args.sample_size,
+        )
+        if refined_generation is not None:
+            refined_generation = _restore_generation_to_original_size(
+                refined_generation,
+                original_size=original_size,
+                sample_size=args.sample_size,
+            )
+
+        stem = Path(rel_triplet).name
+        sample_output_root = args.output_dir if world_size == 1 else os.path.join(args.output_dir, f"rank{local_rank}")
+        sample_output_dir = os.path.join(sample_output_root, f"{index:06d}_{stem}")
+        preview_paths = _save_singleturn_input_visuals(
+            output_dir=sample_output_dir,
+            stem=stem,
+            source_path=image_path,
+            mask_path=mask_path,
+            sample_size=args.sample_size,
+        )
+        coarse_output_paths, refined_output_paths, metadata_path = _save_two_stage_singleturn_result(
+            output_dir=sample_output_dir,
+            stem=stem,
+            coarse_generation=coarse_generation,
+            refined_generation=refined_generation,
+            metadata={
+                "mode": "raw_folder",
+                "raw_data_dir": args.raw_data_dir,
+                "rel_triplet": rel_triplet,
+                "image_path": image_path,
+                "mask_path": mask_path,
+                "gt_path": gt_path if os.path.exists(gt_path) else "",
+                "prompt": CORNE_SINGLETURN_PROMPT,
+                "formatted_prompt": CORNE_SINGLETURN_PROMPT,
+                "seed": args.seed,
+                "num_inference_steps": args.num_inference_steps,
+                "guidance_scale": args.guidance_scale,
+                "sample_size": list(args.sample_size),
+                "original_size": list(original_size),
+                "singleturn_total_frames": args.singleturn_total_frames,
+                "input_previews": preview_paths,
+                "coarse_lora_path": args.lora_path or "",
+                "coarse_lora_alpha": args.lora_alpha,
+                "refinement_enabled": bool(args.enable_refinement),
+                "refinement_lora_path": args.refinement_lora_path or "",
+                "refinement_lora_alpha": args.refinement_lora_alpha,
+                "refinement_guidance_scale": args.refinement_guidance_scale,
+            },
+            fps=args.fps,
+        )
+        results.append(
+            {
+                "output_paths": coarse_output_paths,
+                "refined_output_paths": refined_output_paths,
+                "metadata": metadata_path,
+                "sample_output_dir": sample_output_dir,
+                "rel_triplet": rel_triplet,
+                "image_path": image_path,
+                "mask_path": mask_path,
+                "gt_path": gt_path if os.path.exists(gt_path) else "",
+            }
+        )
+
+    summary_root = args.output_dir if world_size == 1 else os.path.join(args.output_dir, f"rank{local_rank}")
+    summary_path = os.path.join(summary_root, "raw_infer_manifest.json")
+    os.makedirs(summary_root, exist_ok=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+    return {"outputs": results, "summary": summary_path}
 
 
 def _run_singleturn_cached_sample(
@@ -569,7 +824,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             "mask_frame_image": payload.get("mask_frame_image", ""),
             "mask_sam_image": payload.get("mask_sam_image", ""),
             "used_mask_sam": bool(payload.get("used_mask_sam", False)),
-            "total_frames": int(payload.get("total_frames", payload.get("full_latents", torch.empty(0, 0)).shape[1] if "full_latents" in payload else SINGLETURN_TOTAL_FRAMES)),
+            "total_frames": int(payload.get("total_frames", payload.get("full_latents", torch.empty(0, args.singleturn_total_frames)).shape[1] if "full_latents" in payload else args.singleturn_total_frames)),
             "cache_mode": payload.get("mode", ""),
             "idx": 0,
         }
@@ -593,6 +848,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             cached_data_dir,
             corruption_frames=args.singleturn_cache_corruption_frames,
             restoration_frames=args.singleturn_cache_restoration_frames,
+            interpolation_gamma=args.singleturn_cache_interpolation_gamma,
         )
         start_index = max(0, int(args.cached_start_index))
         if start_index >= len(dataset):
@@ -690,6 +946,8 @@ def parse_args():
     parser.add_argument("--cached_sample_path", type=str, default=None, help="Path to one cached SingleTurn sample (.pt).")
     parser.add_argument("--cached_data_meta", type=str, default=None, help="Manifest for cached SingleTurn samples.")
     parser.add_argument("--cached_data_dir", type=str, default=None, help="Root directory used to resolve relative cache paths.")
+    parser.add_argument("--raw_data_dir", type=str, default=None, help="Raw eval directory with img/images and mask/masks folders.")
+    parser.add_argument("--raw_selected_triplets", type=str, default=None, help="Optional selected_triplets.json path for raw folder mode.")
     parser.add_argument("--shared_prompt_cache", type=str, default=None, help="Optional shared prompt embedding cache.")
     parser.add_argument("--cached_start_index", type=int, default=0, help="Start index when iterating over cached manifests.")
     parser.add_argument("--cached_num_samples", type=int, default=None, help="Optional limit when iterating over cached manifests.")
@@ -720,8 +978,8 @@ def parse_args():
     parser.add_argument(
         "--singleturn_total_frames",
         type=int,
-        default=SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
-        help="Total latent frames used in direct image-mode SingleTurn inference. Cached mode ignores this and follows the cache payload.",
+        default=None,
+        help="Total latent frames used in direct image-mode SingleTurn inference. Defaults to corruption/restoration layout size.",
     )
     parser.add_argument(
         "--singleturn_cache_corruption_frames",
@@ -735,16 +993,23 @@ def parse_args():
         default=5,
         help="Number of interpolated frames between noisy anchor and target in the cached layout.",
     )
+    parser.add_argument(
+        "--singleturn_cache_interpolation_gamma",
+        type=float,
+        default=2.0,
+        help="Gamma for non-linear interpolation when cached full_latents are absent.",
+    )
     args = parser.parse_args()
 
     cache_mode = args.cached_sample_path is not None or args.cached_data_meta is not None
     image_mode = args.image_path is not None or args.mask_path is not None
-    if cache_mode and image_mode:
-        raise ValueError("Choose either direct image mode or cached mode, not both.")
-    if not cache_mode:
+    raw_mode = args.raw_data_dir is not None
+    if sum([cache_mode, image_mode, raw_mode]) != 1:
+        raise ValueError("Choose exactly one mode: direct image, cached, or raw folder.")
+    if image_mode:
         if args.image_path is None or args.mask_path is None:
             raise ValueError("Image mode requires both --image_path and --mask_path.")
-    else:
+    elif cache_mode:
         if args.cached_sample_path is not None and args.cached_data_meta is not None:
             raise ValueError("Choose either --cached_sample_path or --cached_data_meta, not both.")
         if args.cached_sample_path is None and args.cached_data_meta is None:
@@ -753,15 +1018,32 @@ def parse_args():
             raise ValueError("--cached_num_workers must be non-negative.")
         if args.cached_prefetch_factor <= 0:
             raise ValueError("--cached_prefetch_factor must be positive.")
+    else:
+        if not os.path.isdir(args.raw_data_dir):
+            raise ValueError(f"--raw_data_dir must be an existing directory, got {args.raw_data_dir}.")
+        if args.raw_selected_triplets is not None and not os.path.exists(args.raw_selected_triplets):
+            raise ValueError(f"--raw_selected_triplets does not exist: {args.raw_selected_triplets}")
 
     if args.enable_refinement and not args.refinement_lora_path:
         raise ValueError("--enable_refinement requires --refinement_lora_path.")
     if (not args.enable_refinement) and args.refinement_lora_path is not None:
         raise ValueError("--refinement_lora_path requires --enable_refinement.")
-    if args.singleturn_total_frames < 8:
-        raise ValueError(f"--singleturn_total_frames must be >= 8, got {args.singleturn_total_frames}.")
     if args.singleturn_cache_corruption_frames < 0 or args.singleturn_cache_restoration_frames < 0:
         raise ValueError("--singleturn_cache_corruption_frames and --singleturn_cache_restoration_frames must be non-negative.")
+    expected_singleturn_total_frames = compute_singleturn_object_removal_total_frames(
+        args.singleturn_cache_corruption_frames,
+        args.singleturn_cache_restoration_frames,
+    )
+    if args.singleturn_total_frames is None:
+        args.singleturn_total_frames = expected_singleturn_total_frames
+    elif args.singleturn_total_frames != expected_singleturn_total_frames:
+        raise ValueError(
+            "--singleturn_total_frames must match --singleturn_cache_corruption_frames/"
+            "--singleturn_cache_restoration_frames layout, "
+            f"got {args.singleturn_total_frames} vs expected {expected_singleturn_total_frames}."
+        )
+    if args.singleturn_cache_interpolation_gamma <= 0:
+        raise ValueError("--singleturn_cache_interpolation_gamma must be positive.")
 
     args.sample_size = normalize_singleturn_sample_size(args.sample_size)
     if any(dim % 16 != 0 for dim in args.sample_size):
@@ -848,7 +1130,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     default_prompt_cache = _encode_fixed_prompt(tokenizer, text_encoder, device, weight_dtype)
 
-    if args.cached_sample_path is not None or args.cached_data_meta is not None:
+    if args.raw_data_dir is not None:
+        result = _run_singleturn_raw_folder_mode(
+            pipeline=pipeline,
+            args=args,
+            weight_dtype=weight_dtype,
+            generator=generator,
+        )
+    elif args.cached_sample_path is not None or args.cached_data_meta is not None:
         result = _run_singleturn_cached_mode(
             pipeline=pipeline,
             args=args,
