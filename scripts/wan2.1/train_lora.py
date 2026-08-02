@@ -1058,6 +1058,11 @@ def parse_args():
         help="Gamma for non-linear interpolation when cached full_latents are absent.",
     )
     parser.add_argument(
+        "--singleturn_train_mask_sam_only",
+        action="store_true",
+        help="Use mask_sam_latent for the training mask condition frame instead of 50/50 mask_check/mask_sam.",
+    )
+    parser.add_argument(
         "--singleturn_validation_image_path",
         type=str,
         default=None,
@@ -1700,7 +1705,8 @@ def main():
                 corruption_frames=args.singleturn_cache_corruption_frames,
                 restoration_frames=args.singleturn_cache_restoration_frames,
                 interpolation_gamma=args.singleturn_cache_interpolation_gamma,
-                random_mask_frame_latent=args.singleturn_mode,
+                random_mask_frame_latent=args.singleturn_mode and not args.singleturn_train_mask_sam_only,
+                mask_condition_source="mask_sam" if args.singleturn_train_mask_sam_only else "mask_check",
             )
         else:
             train_dataset = CachedVideoLatentDataset(args.cached_data_meta, args.cached_data_dir)

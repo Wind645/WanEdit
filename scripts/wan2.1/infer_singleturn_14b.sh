@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export MODEL_NAME=${MODEL_NAME:-/mnt/cpfs/jiachengliu/pretrained_models/Wan-AI/Wan2.1-T2V-1.3B}
+export MODEL_NAME=${MODEL_NAME:-/mnt/cpfs/jiachengliu/pretrained_models/Wan-AI/Wan2.1-T2V-14B}
 export IMAGE_PATH=${IMAGE_PATH:-}
 export MASK_PATH=${MASK_PATH:-}
 export PROMPT=${PROMPT:-}

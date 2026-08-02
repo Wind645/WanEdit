@@ -345,6 +345,7 @@ class CachedSingleTurnLatentDataset(Dataset):
         restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
         interpolation_gamma: float = 2.0,
         random_mask_frame_latent: bool = False,
+        mask_condition_source: str = "mask_check",
     ):
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
@@ -357,6 +358,9 @@ class CachedSingleTurnLatentDataset(Dataset):
         self.restoration_frames = int(restoration_frames)
         self.interpolation_gamma = float(interpolation_gamma)
         self.random_mask_frame_latent = bool(random_mask_frame_latent)
+        if mask_condition_source not in ("mask_check", "mask_sam"):
+            raise ValueError(f"mask_condition_source must be 'mask_check' or 'mask_sam', got {mask_condition_source!r}.")
+        self.mask_condition_source = mask_condition_source
         self._shared_prompt_cache_payloads: Dict[str, Dict[str, Any]] = {}
 
     def __len__(self) -> int:
@@ -474,16 +478,26 @@ class CachedSingleTurnLatentDataset(Dataset):
         if self.expected_mode == "singleturn_object_removal_cached" or is_supported_singleturn_object_removal_mode(self.expected_mode):
             mask_check_frame_latent = payload.get("mask_check_latent")
             mask_sam_latent = payload.get("mask_sam_latent")
-            mask_frame_latent = payload.get("mask_frame_latent", mask_check_frame_latent)
+            fallback_mask_frame_latent = payload.get("mask_frame_latent")
+            selected_used_mask_sam = False
+            mask_frame_latent = mask_check_frame_latent if mask_check_frame_latent is not None else fallback_mask_frame_latent
             if self.random_mask_frame_latent and mask_sam_latent is not None:
-                mask_frame_latent = mask_sam_latent if float(torch.rand((), device=mask_sam_latent.device).item()) < 0.5 else mask_check_frame_latent
+                selected_used_mask_sam = float(torch.rand((), device=mask_sam_latent.device).item()) < 0.5
+                mask_frame_latent = (
+                    mask_sam_latent
+                    if selected_used_mask_sam
+                    else mask_check_frame_latent if mask_check_frame_latent is not None else fallback_mask_frame_latent
+                )
+            elif self.mask_condition_source == "mask_sam":
+                selected_used_mask_sam = True
+                mask_frame_latent = mask_sam_latent
             full_latents = payload.get("full_latents")
             required_keys = ("source_frame_latent",)
             if full_latents is None:
                 required_keys = ("mask_check_latent", "source_frame_latent", "noisy_anchor_latent", "target_latent")
             missing = [key for key in required_keys if key not in payload]
             if mask_frame_latent is None:
-                missing.append("mask_frame_latent")
+                missing.append("mask_sam_latent" if selected_used_mask_sam else "mask_check_latent")
             if missing:
                 raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}")
             if full_latents is None:
@@ -494,6 +508,11 @@ class CachedSingleTurnLatentDataset(Dataset):
                     noisy_anchor_latent=payload["noisy_anchor_latent"],
                     target_latent=payload["target_latent"],
                 )
+            elif full_latents.shape[-3] > 0:
+                full_latents = full_latents.clone()
+                full_latents[..., 0:1, :, :] = mask_frame_latent
+                if mask_check_frame_latent is not None and full_latents.shape[-3] > 1:
+                    full_latents[..., 1:2, :, :] = mask_check_frame_latent
             payload_total_frames = payload.get("total_frames")
             total_frames = int(payload_total_frames) if payload_total_frames is not None else int(full_latents.shape[-3])
             if full_latents.shape[-3] != total_frames:
@@ -508,6 +527,7 @@ class CachedSingleTurnLatentDataset(Dataset):
                     "source_frame_latent": payload["source_frame_latent"],
                     "total_frames": total_frames,
                     "cache_mode": payload_mode,
+                    "used_mask_sam": selected_used_mask_sam,
                 }
             )
             if "edge_weight_map" in payload:

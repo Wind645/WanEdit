@@ -804,10 +804,16 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
                 f"Cached SingleTurn sample {cache_path} has unsupported mode={payload_mode!r}. "
                 "Re-run CORNE object-removal preprocess / patch to generate a supported cache."
             )
-        mask_frame_latent = payload.get("mask_frame_latent", payload.get("mask_check_latent"))
+        used_mask_sam = args.singleturn_mask_condition_source == "mask_sam"
+        if used_mask_sam:
+            mask_frame_latent = payload.get("mask_sam_latent")
+        else:
+            mask_frame_latent = payload.get("mask_check_latent")
+            if mask_frame_latent is None:
+                mask_frame_latent = payload.get("mask_frame_latent")
         missing = [key for key in ("source_frame_latent",) if key not in payload]
         if mask_frame_latent is None:
-            missing.append("mask_frame_latent")
+            missing.append("mask_sam_latent" if used_mask_sam else "mask_check_latent")
         if missing:
             raise ValueError(f"Cached SingleTurn sample {cache_path} is missing keys: {missing}.")
         prompt_cache = shared_prompt_cache
@@ -823,7 +829,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             "mask_check_image": payload.get("mask_check_image", ""),
             "mask_frame_image": payload.get("mask_frame_image", ""),
             "mask_sam_image": payload.get("mask_sam_image", ""),
-            "used_mask_sam": bool(payload.get("used_mask_sam", False)),
+            "used_mask_sam": used_mask_sam,
             "total_frames": int(payload.get("total_frames", payload.get("full_latents", torch.empty(0, args.singleturn_total_frames)).shape[1] if "full_latents" in payload else args.singleturn_total_frames)),
             "cache_mode": payload.get("mode", ""),
             "idx": 0,
@@ -849,6 +855,7 @@ def _run_singleturn_cached_mode(pipeline, args, weight_dtype, generator, default
             corruption_frames=args.singleturn_cache_corruption_frames,
             restoration_frames=args.singleturn_cache_restoration_frames,
             interpolation_gamma=args.singleturn_cache_interpolation_gamma,
+            mask_condition_source=args.singleturn_mask_condition_source,
         )
         start_index = max(0, int(args.cached_start_index))
         if start_index >= len(dataset):
@@ -998,6 +1005,13 @@ def parse_args():
         type=float,
         default=2.0,
         help="Gamma for non-linear interpolation when cached full_latents are absent.",
+    )
+    parser.add_argument(
+        "--singleturn_mask_condition_source",
+        type=str,
+        default="mask_check",
+        choices=["mask_check", "mask_sam"],
+        help="Cached inference mask condition latent source.",
     )
     args = parser.parse_args()
 
