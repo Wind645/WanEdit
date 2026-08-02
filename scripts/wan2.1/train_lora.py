@@ -327,14 +327,14 @@ def log_singleturn_validation_to_wandb(args, global_step, source_image_path, for
             caption=formatted_prompt,
         ),
         "singleturn_validation/full_sequence": wandb.Video(
-            output_paths["full_gif"],
+            output_paths["full_video"],
             fps=args.singleturn_validation_fps,
-            format="gif",
+            format="mp4",
         ),
         "singleturn_validation/tail_sequence": wandb.Video(
-            output_paths["tail_gif"],
+            output_paths["tail_video"],
             fps=args.singleturn_validation_fps,
-            format="gif",
+            format="mp4",
         ),
     }
     wandb.log(wandb_payload, step=global_step)

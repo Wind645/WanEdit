@@ -952,13 +952,13 @@ def save_singleturn_outputs(
     full_frames = full_frames.detach().cpu().float()
     tail_frames = tail_frames.detach().cpu().float()
 
-    full_gif = os.path.join(output_dir, f"{stem}_full.gif")
-    tail_gif = os.path.join(output_dir, f"{stem}_tail.gif")
+    full_video = os.path.join(output_dir, f"{stem}_full.mp4")
+    tail_video = os.path.join(output_dir, f"{stem}_tail.mp4")
     full_last = os.path.join(output_dir, f"{stem}_frame8.png")
     tail_last = os.path.join(output_dir, f"{stem}_tail_frame8.png")
 
-    save_videos_grid(full_frames, full_gif, fps=fps)
-    save_videos_grid(tail_frames, tail_gif, fps=fps)
+    save_videos_grid(full_frames, full_video, fps=fps)
+    save_videos_grid(tail_frames, tail_video, fps=fps)
 
     full_last_frame = (full_frames[0, :, -1].permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
     tail_last_frame = (tail_frames[0, :, -1].permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
@@ -966,8 +966,8 @@ def save_singleturn_outputs(
     Image.fromarray(tail_last_frame).save(tail_last)
 
     return {
-        "full_gif": full_gif,
-        "tail_gif": tail_gif,
+        "full_video": full_video,
+        "tail_video": tail_video,
         "full_last_frame": full_last,
         "tail_last_frame": tail_last,
     }
