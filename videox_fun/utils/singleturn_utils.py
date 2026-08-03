@@ -956,6 +956,8 @@ def save_singleturn_outputs(
     tail_video = os.path.join(output_dir, f"{stem}_tail.mp4")
     full_last = os.path.join(output_dir, f"{stem}_frame8.png")
     tail_last = os.path.join(output_dir, f"{stem}_tail_frame8.png")
+    full_last_pure = os.path.join(output_dir, f"{stem}_frame8_pure.png")
+    tail_last_pure = os.path.join(output_dir, f"{stem}_tail_frame8_pure.png")
 
     save_videos_grid(full_frames, full_video, fps=fps)
     save_videos_grid(tail_frames, tail_video, fps=fps)
@@ -964,10 +966,14 @@ def save_singleturn_outputs(
     tail_last_frame = (tail_frames[0, :, -1].permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
     Image.fromarray(full_last_frame).save(full_last)
     Image.fromarray(tail_last_frame).save(tail_last)
+    Image.fromarray(full_last_frame).save(full_last_pure)
+    Image.fromarray(tail_last_frame).save(tail_last_pure)
 
     return {
         "full_video": full_video,
         "tail_video": tail_video,
         "full_last_frame": full_last,
         "tail_last_frame": tail_last,
+        "full_last_frame_pure": full_last_pure,
+        "tail_last_frame_pure": tail_last_pure,
     }

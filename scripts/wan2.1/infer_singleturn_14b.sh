@@ -15,15 +15,16 @@ export CACHED_START_INDEX=${CACHED_START_INDEX:-0}
 export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-}
 export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/14b_maskpred_masksam_cache_ckpt800}
-export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_maskpred/checkpoint-700/lora_diffusion_pytorch_model.safetensors}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-7}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/14b_removal_blending}
+export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_maskpred/checkpoint-2100/lora_diffusion_pytorch_model.safetensors}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
+export ENABLE_MASK_BLENDING=${ENABLE_MASK_BLENDING:-1}
 export REFINEMENT_LORA_PATH=${REFINEMENT_LORA_PATH:-}
 export REFINEMENT_LORA_ALPHA=${REFINEMENT_LORA_ALPHA:-1.0}
 export REFINEMENT_GUIDANCE_SCALE=${REFINEMENT_GUIDANCE_SCALE:-1.0}
 
-NPROC_PER_NODE=${NPROC_PER_NODE:-1}
+NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-50}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-5.0}
 SAMPLE_HEIGHT=${SAMPLE_HEIGHT:-${SAMPLE_SIZE:-480}}
@@ -65,6 +66,12 @@ cmd_base=(
   --fps "$FPS"
   --dtype "$DTYPE"
 )
+
+if [[ "${ENABLE_MASK_BLENDING}" == "1" ]]; then
+  cmd_base+=(
+    --enable_mask_blending
+  )
+fi
 
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   cmd=(

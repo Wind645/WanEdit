@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import FlowMatchEulerDiscreteScheduler
@@ -32,6 +33,8 @@ from videox_fun.pipeline import WanPipeline
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
+    SINGLETURN_MASK_PREDICTION_FRAME_INDEX,
+    SINGLETURN_TAIL_START,
     SINGLETURN_TOTAL_FRAMES,
     compute_singleturn_object_removal_total_frames,
     generate_singleturn_sample,
@@ -349,6 +352,52 @@ def _restore_generation_to_original_size(
     }
 
 
+def _load_source_frame_for_blending(source_path: str, *, height: int, width: int, sample_size: tuple[int, int]) -> torch.Tensor:
+    if (height, width) == tuple(sample_size):
+        source = preprocess_singleturn_image(source_path, sample_size, add_batch_dim=False, add_frame_dim=False)
+        source = ((source.float() + 1.0) / 2.0).clamp(0, 1)
+    else:
+        with Image.open(source_path) as image:
+            image = image.convert("RGB").resize((width, height), resample=Image.BILINEAR)
+            source = torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0).permute(2, 0, 1).contiguous()
+    return source.unsqueeze(0).unsqueeze(2)
+
+
+def _save_singleturn_blended_last_frames(
+    generation: dict,
+    output_paths: dict,
+    *,
+    source_path: str,
+    sample_size: tuple[int, int],
+) -> None:
+    if not source_path or not os.path.exists(source_path):
+        return
+
+    full_frames = generation["full_frames"].detach().cpu().float()
+    if full_frames.ndim != 5 or full_frames.shape[2] <= max(SINGLETURN_MASK_PREDICTION_FRAME_INDEX, SINGLETURN_TAIL_START):
+        return
+
+    height, width = full_frames.shape[-2:]
+    source_frame = _load_source_frame_for_blending(
+        source_path,
+        height=height,
+        width=width,
+        sample_size=sample_size,
+    ).to(dtype=full_frames.dtype)
+    alpha = full_frames[:, :, SINGLETURN_MASK_PREDICTION_FRAME_INDEX : SINGLETURN_MASK_PREDICTION_FRAME_INDEX + 1]
+    alpha = alpha.mean(dim=1, keepdim=True).clamp(0, 1)
+
+    last_frame = full_frames[:, :, -1:]
+    blended_last = alpha * last_frame + (1.0 - alpha) * source_frame
+    frame = blended_last[0, :, 0].permute(1, 2, 0).clamp(0, 1).numpy()
+    image = Image.fromarray((frame * 255).astype(np.uint8))
+
+    for key in ("full_last_frame", "tail_last_frame"):
+        path = output_paths.get(key)
+        if path:
+            image.save(path)
+
+
 def _save_singleturn_input_visuals(
     *,
     output_dir: str,
@@ -516,6 +565,7 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             "guidance_scale": args.guidance_scale,
             "sample_size": list(args.sample_size),
             "singleturn_total_frames": args.singleturn_total_frames,
+            "mask_blending_enabled": bool(args.enable_mask_blending),
             "input_previews": preview_paths,
             "coarse_lora_path": args.lora_path or "",
             "coarse_lora_alpha": args.lora_alpha,
@@ -526,6 +576,20 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
         },
         fps=args.fps,
     )
+    if args.enable_mask_blending:
+        _save_singleturn_blended_last_frames(
+            coarse_generation,
+            coarse_output_paths,
+            source_path=args.image_path,
+            sample_size=args.sample_size,
+        )
+        if refined_generation is not None and refined_output_paths is not None:
+            _save_singleturn_blended_last_frames(
+                refined_generation,
+                refined_output_paths,
+                source_path=args.image_path,
+                sample_size=args.sample_size,
+            )
 
     return {
         "outputs": coarse_output_paths,
@@ -612,7 +676,6 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
                 original_size=original_size,
                 sample_size=args.sample_size,
             )
-
         stem = Path(rel_triplet).name
         sample_output_root = args.output_dir if world_size == 1 else os.path.join(args.output_dir, f"rank{local_rank}")
         sample_output_dir = os.path.join(sample_output_root, f"{index:06d}_{stem}")
@@ -643,6 +706,7 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
                 "sample_size": list(args.sample_size),
                 "original_size": list(original_size),
                 "singleturn_total_frames": args.singleturn_total_frames,
+                "mask_blending_enabled": bool(args.enable_mask_blending),
                 "input_previews": preview_paths,
                 "coarse_lora_path": args.lora_path or "",
                 "coarse_lora_alpha": args.lora_alpha,
@@ -653,6 +717,20 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
             },
             fps=args.fps,
         )
+        if args.enable_mask_blending:
+            _save_singleturn_blended_last_frames(
+                coarse_generation,
+                coarse_output_paths,
+                source_path=image_path,
+                sample_size=args.sample_size,
+            )
+            if refined_generation is not None and refined_output_paths is not None:
+                _save_singleturn_blended_last_frames(
+                    refined_generation,
+                    refined_output_paths,
+                    source_path=image_path,
+                    sample_size=args.sample_size,
+                )
         results.append(
             {
                 "output_paths": coarse_output_paths,
@@ -755,6 +833,7 @@ def _run_singleturn_cached_sample(
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "singleturn_total_frames": total_frames,
+            "mask_blending_enabled": bool(args.enable_mask_blending),
             "cache_mode": sample.get("cache_mode", ""),
             "mask_frame_image": mask_frame_path,
             "input_previews": preview_paths,
@@ -767,6 +846,20 @@ def _run_singleturn_cached_sample(
         },
         fps=args.fps,
     )
+    if args.enable_mask_blending:
+        _save_singleturn_blended_last_frames(
+            coarse_generation,
+            coarse_output_paths,
+            source_path=source_path,
+            sample_size=args.sample_size,
+        )
+        if refined_generation is not None and refined_output_paths is not None:
+            _save_singleturn_blended_last_frames(
+                refined_generation,
+                refined_output_paths,
+                source_path=source_path,
+                sample_size=args.sample_size,
+            )
 
     return {
         "output_paths": coarse_output_paths,
@@ -1012,6 +1105,11 @@ def parse_args():
         default="mask_check",
         choices=["mask_check", "mask_sam"],
         help="Cached inference mask condition latent source.",
+    )
+    parser.add_argument(
+        "--enable_mask_blending",
+        action="store_true",
+        help="Blend saved last-frame PNGs with the source image using the predicted mask frame as soft alpha.",
     )
     args = parser.parse_args()
 
