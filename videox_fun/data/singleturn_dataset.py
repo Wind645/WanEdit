@@ -480,9 +480,25 @@ class CachedSingleTurnLatentDataset(Dataset):
             return cached
 
         payload = load_singleturn_cache_payload(resolved_path)
-        missing = [key for key in ("prompt_embeds", "prompt_seq_len") if key not in payload]
-        if missing:
-            raise ValueError(f"SingleTurn shared prompt cache {resolved_path} is missing keys: {missing}")
+
+        # New format: part1/part2 keys for decoupled cross-attention
+        if "part1" in payload and "part2" in payload:
+            part1 = payload["part1"]
+            part2 = payload["part2"]
+            part1_embed = part1["embedding"]
+            part2_embed = part2["embedding"]
+            prompt_embeds = torch.cat([part1_embed, part2_embed], dim=0)
+            prompt_seq_len = prompt_embeds.shape[0]
+            text_split_point = int(part1["seq_len"]) if "seq_len" in part1 else part1_embed.shape[0]
+            payload["prompt_embeds"] = prompt_embeds
+            payload["prompt_seq_len"] = prompt_seq_len
+            payload["text_split_point"] = text_split_point
+        else:
+            missing = [key for key in ("prompt_embeds", "prompt_seq_len") if key not in payload]
+            if missing:
+                raise ValueError(f"SingleTurn shared prompt cache {resolved_path} is missing keys: {missing}")
+            payload["text_split_point"] = None
+
         self._shared_prompt_cache_payloads[resolved_path] = payload
         return payload
 
@@ -547,6 +563,7 @@ class CachedSingleTurnLatentDataset(Dataset):
         prompt_seq_len = payload.get("prompt_seq_len")
         prompt_text = payload.get("text", CORNE_SINGLETURN_PROMPT)
         formatted_text = payload.get("formatted_text", prompt_text)
+        text_split_point = None
         shared_prompt_cache = payload.get("shared_prompt_cache")
         if shared_prompt_cache is not None:
             shared_payload = self._load_shared_prompt_cache(shared_prompt_cache)
@@ -554,6 +571,7 @@ class CachedSingleTurnLatentDataset(Dataset):
             prompt_seq_len = int(shared_payload["prompt_seq_len"])
             prompt_text = shared_payload.get("text", prompt_text)
             formatted_text = shared_payload.get("formatted_text", prompt_text)
+            text_split_point = shared_payload.get("text_split_point")
 
         if prompt_embeds is None or prompt_seq_len is None:
             raise ValueError(
@@ -563,6 +581,7 @@ class CachedSingleTurnLatentDataset(Dataset):
         sample = {
             "prompt_embeds": prompt_embeds,
             "prompt_seq_len": int(prompt_seq_len),
+            "text_split_point": text_split_point if text_split_point is not None else -1,
             "text": prompt_text,
             "formatted_text": formatted_text,
             "cache_path": cache_path,

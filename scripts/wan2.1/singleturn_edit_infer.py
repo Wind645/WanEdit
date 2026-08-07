@@ -96,12 +96,29 @@ def _resolve_cache_path(cache_path: str, cached_data_dir: Optional[str]) -> str:
 
 def _load_shared_prompt_cache(shared_prompt_cache: str):
     payload = load_singleturn_cache_payload(shared_prompt_cache)
+    # New format: part1/part2 keys for decoupled cross-attention
+    if "part1" in payload and "part2" in payload:
+        part1 = payload["part1"]
+        part2 = payload["part2"]
+        part1_embed = part1["embedding"]
+        part2_embed = part2["embedding"]
+        prompt_embeds = torch.cat([part1_embed, part2_embed], dim=0)
+        prompt_seq_len = prompt_embeds.shape[0]
+        text_split_point = int(part1["seq_len"]) if "seq_len" in part1 else part1_embed.shape[0]
+        return {
+            "prompt_embeds": prompt_embeds,
+            "prompt_seq_len": prompt_seq_len,
+            "text_split_point": text_split_point,
+            "text": payload.get("text", CORNE_SINGLETURN_PROMPT),
+            "formatted_text": payload.get("formatted_text", payload.get("text", CORNE_SINGLETURN_PROMPT)),
+        }
     missing = [key for key in ("prompt_embeds", "prompt_seq_len") if key not in payload]
     if missing:
         raise ValueError(f"Shared prompt cache {shared_prompt_cache} is missing keys: {missing}")
     return {
         "prompt_embeds": payload["prompt_embeds"],
         "prompt_seq_len": int(payload["prompt_seq_len"]),
+        "text_split_point": None,
         "text": payload.get("text", CORNE_SINGLETURN_PROMPT),
         "formatted_text": payload.get("formatted_text", payload.get("text", CORNE_SINGLETURN_PROMPT)),
     }
@@ -883,6 +900,19 @@ def _run_singleturn_cached_sample(
 
     with torch.no_grad():
         total_frames = int(sample.get("total_frames", SINGLETURN_TOTAL_FRAMES))
+
+        # Compute split points for decoupled cross-attention
+        text_split_point = prompt_cache.get("text_split_point")
+        latent_split_point = None
+        if text_split_point is not None:
+            patch_size = pipeline.transformer.config.patch_size
+            # source_frame_latent shape: (B, C, 1, H_latent, W_latent)
+            _h_latent = sample["source_frame_latent"].shape[-2]
+            _w_latent = sample["source_frame_latent"].shape[-1]
+            tokens_per_frame = (_h_latent // patch_size[1]) * (_w_latent // patch_size[2])
+            noisy_anchor_frame_index = SINGLETURN_TAIL_START + args.singleturn_cache_corruption_frames
+            latent_split_point = (noisy_anchor_frame_index + 1) * tokens_per_frame
+
         coarse_generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
             mask_frame_latent=sample["mask_frame_latent"],
@@ -903,6 +933,8 @@ def _run_singleturn_cached_sample(
             trajectory_refinement_restoration_frames=args.singleturn_cache_restoration_frames,
             trajectory_refinement_gamma=args.trajectory_refinement_gamma,
             trajectory_refinement_strength=args.trajectory_refinement_strength,
+            latent_split_point=latent_split_point,
+            text_split_point=text_split_point,
         )
         refined_generation = None
         if args.enable_refinement:

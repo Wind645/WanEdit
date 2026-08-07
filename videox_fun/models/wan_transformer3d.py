@@ -307,30 +307,58 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, dtype=torch.bfloat16, t=0):
+    def forward(self, x, context, context_lens, dtype=torch.bfloat16, t=0,
+                latent_split_point=None, text_split_point=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            latent_split_point(int, optional): Token index to split latent into front/back
+            text_split_point(int, optional): Token index to split context into part1/part2
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        # compute query, key, value
-        q = self.norm_q(self.q(x.to(dtype))).view(b, -1, n, d)
-        k = self.norm_k(self.k(context.to(dtype))).view(b, -1, n, d)
-        v = self.v(context.to(dtype)).view(b, -1, n, d)
+        if latent_split_point is None or text_split_point is None:
+            # compute query, key, value
+            q = self.norm_q(self.q(x.to(dtype))).view(b, -1, n, d)
+            k = self.norm_k(self.k(context.to(dtype))).view(b, -1, n, d)
+            v = self.v(context.to(dtype)).view(b, -1, n, d)
 
-        # compute attention
-        x = attention(
-            q.to(dtype), 
-            k.to(dtype), 
-            v.to(dtype), 
-            k_lens=context_lens
-        )
-        x = x.to(dtype)
+            # compute attention
+            x = attention(
+                q.to(dtype),
+                k.to(dtype),
+                v.to(dtype),
+                k_lens=context_lens
+            )
+            x = x.to(dtype)
 
-        # output
+            # output
+            x = x.flatten(2)
+            x = self.o(x)
+            return x
+
+        # Decoupled cross-attention: front latent <-> text part1, back latent <-> text part2
+        x_front = x[:, :latent_split_point]
+        x_back = x[:, latent_split_point:]
+
+        context_part1 = context[:, :text_split_point]
+        context_part2 = context[:, text_split_point:]
+
+        q_front = self.norm_q(self.q(x_front.to(dtype))).view(b, -1, n, d)
+        q_back = self.norm_q(self.q(x_back.to(dtype))).view(b, -1, n, d)
+
+        k1 = self.norm_k(self.k(context_part1.to(dtype))).view(b, -1, n, d)
+        v1 = self.v(context_part1.to(dtype)).view(b, -1, n, d)
+
+        k2 = self.norm_k(self.k(context_part2.to(dtype))).view(b, -1, n, d)
+        v2 = self.v(context_part2.to(dtype)).view(b, -1, n, d)
+
+        out_front = attention(q_front.to(dtype), k1.to(dtype), v1.to(dtype), k_lens=None)
+        out_back = attention(q_back.to(dtype), k2.to(dtype), v2.to(dtype), k_lens=None)
+
+        x = torch.cat([out_front.to(dtype), out_back.to(dtype)], dim=1)
         x = x.flatten(2)
         x = self.o(x)
         return x
@@ -351,7 +379,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, context_lens, dtype=torch.bfloat16, t=0):
+    def forward(self, x, context, context_lens, dtype=torch.bfloat16, t=0, **kwargs):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -394,7 +422,7 @@ class WanI2VCrossAttention(WanSelfAttention):
 
 
 class WanCrossAttention(WanSelfAttention):
-    def forward(self, x, context, context_lens, dtype=torch.bfloat16, t=0):
+    def forward(self, x, context, context_lens, dtype=torch.bfloat16, t=0, **kwargs):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -474,6 +502,8 @@ class WanAttentionBlock(nn.Module):
         t=0,
         frame_split_indices=None,
         ground_frame_indices=None,
+        latent_split_point=None,
+        text_split_point=None,
     ):
         r"""
         Args:
@@ -484,6 +514,8 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             frame_split_indices(List[int], optional): Split indices for paired data temporal RoPE
             ground_frame_indices(List[Tuple[int, int]], optional): Ground frame positions for special temporal RoPE
+            latent_split_point(int, optional): Token index to split latent for decoupled cross-attn
+            text_split_point(int, optional): Token index to split context for decoupled cross-attn
         """
         if e.dim() > 3:
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
@@ -501,7 +533,9 @@ class WanAttentionBlock(nn.Module):
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             # cross-attention
-            x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype, t=t)
+            x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype, t=t,
+                                    latent_split_point=latent_split_point,
+                                    text_split_point=text_split_point)
 
             # ffn function
             temp_x = self.norm2(x) * (1 + e[4]) + e[3]
@@ -830,6 +864,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         cond_flag=True,
         frame_split_indices=None,
         ground_frame_indices=None,
+        latent_split_point=None,
+        text_split_point=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1007,6 +1043,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                             t,
                             frame_split_indices,
                             ground_frame_indices,
+                            latent_split_point,
+                            text_split_point,
                             **ckpt_kwargs,
                         )
                     else:
@@ -1022,9 +1060,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                             t=t,
                             frame_split_indices=frame_split_indices,
                             ground_frame_indices=ground_frame_indices,
+                            latent_split_point=latent_split_point,
+                            text_split_point=text_split_point,
                         )
                         x = block(x, **kwargs)
-                    
+
                 if cond_flag:
                     self.teacache.previous_residual_cond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
                 else:
@@ -1052,6 +1092,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                         t,
                         frame_split_indices,
                         ground_frame_indices,
+                        latent_split_point,
+                        text_split_point,
                         **ckpt_kwargs,
                     )
                 else:
@@ -1067,6 +1109,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                         t=t,
                         frame_split_indices=frame_split_indices,
                         ground_frame_indices=ground_frame_indices,
+                        latent_split_point=latent_split_point,
+                        text_split_point=text_split_point,
                     )
                     x = block(x, **kwargs)
 

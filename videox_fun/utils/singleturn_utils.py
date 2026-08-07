@@ -718,6 +718,8 @@ def _run_singleturn_generation(
     trajectory_refinement_restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
     trajectory_refinement_gamma: float = 2.0,
     trajectory_refinement_strength: float = 1.0,
+    latent_split_point: Optional[int] = None,
+    text_split_point: Optional[int] = None,
 ):
     device = pipeline._execution_device
     do_classifier_free_guidance = guidance_scale > 1.0
@@ -822,6 +824,8 @@ def _run_singleturn_generation(
                 context=context,
                 t=timestep.expand(latent_model_input.shape[0]),
                 seq_len=seq_len,
+                latent_split_point=latent_split_point,
+                text_split_point=text_split_point,
             )
 
         if do_classifier_free_guidance:
@@ -881,6 +885,8 @@ def generate_singleturn_sample(
     trajectory_refinement_restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
     trajectory_refinement_gamma: float = 2.0,
     trajectory_refinement_strength: float = 1.0,
+    latent_split_point: Optional[int] = None,
+    text_split_point: Optional[int] = None,
 ):
     del prompt
     del prompt_template
@@ -914,6 +920,8 @@ def generate_singleturn_sample(
         trajectory_refinement_restoration_frames=trajectory_refinement_restoration_frames,
         trajectory_refinement_gamma=trajectory_refinement_gamma,
         trajectory_refinement_strength=trajectory_refinement_strength,
+        latent_split_point=latent_split_point,
+        text_split_point=text_split_point,
     )
 
 
@@ -938,6 +946,8 @@ def generate_singleturn_sample_from_latents(
     trajectory_refinement_restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
     trajectory_refinement_gamma: float = 2.0,
     trajectory_refinement_strength: float = 1.0,
+    latent_split_point: Optional[int] = None,
+    text_split_point: Optional[int] = None,
 ):
     device = pipeline._execution_device
     weight_dtype = weight_dtype or getattr(pipeline.transformer, "dtype", torch.float32)
@@ -970,6 +980,8 @@ def generate_singleturn_sample_from_latents(
         trajectory_refinement_restoration_frames=trajectory_refinement_restoration_frames,
         trajectory_refinement_gamma=trajectory_refinement_gamma,
         trajectory_refinement_strength=trajectory_refinement_strength,
+        latent_split_point=latent_split_point,
+        text_split_point=text_split_point,
     )
 
 

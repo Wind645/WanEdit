@@ -109,6 +109,7 @@ from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
                                                resize_singleturn_mask_to_latent_grid,
                                                SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
                                                SINGLETURN_SOURCE_CONDITION_FRAME_INDEX,
+                                               SINGLETURN_TAIL_START,
                                                save_singleturn_outputs)
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
 
@@ -205,7 +206,12 @@ def load_cached_singleturn_batch(batch, weight_dtype, device, refinement_mode=Fa
             dtype=weight_dtype,
             non_blocking=True,
         )
-    return full_latents, prompt_embeds, target_latents, refinement_loss_weight_map
+    text_split_point = None
+    if "text_split_point" in batch:
+        tsp_val = int(batch["text_split_point"][0].item())
+        if tsp_val >= 0:
+            text_split_point = tsp_val
+    return full_latents, prompt_embeds, target_latents, refinement_loss_weight_map, text_split_point
 
 
 def load_singleturn_shared_prompt_cache(prompt_cache_path, weight_dtype, device):
@@ -2199,6 +2205,8 @@ def main():
                 singleturn_supervised_start_frames = None
                 singleturn_refine_target_latents = None
                 singleturn_refine_loss_weight_map = None
+                text_split_point = None
+                latent_split_point = None
                 if use_cached_data:
                     with torch.no_grad():
                         if args.singleturn_mode:
@@ -2207,6 +2215,7 @@ def main():
                                 prompt_embeds,
                                 singleturn_refine_target_latents,
                                 singleturn_refine_loss_weight_map,
+                                text_split_point,
                             ) = load_cached_singleturn_batch(
                                 batch=batch,
                                 weight_dtype=weight_dtype,
@@ -2615,6 +2624,13 @@ def main():
                     latents,
                     accelerator.unwrap_model(transformer3d).config.patch_size,
                 )
+                # Compute latent_split_point for decoupled cross-attention
+                if text_split_point is not None and args.singleturn_mode:
+                    _patch_size = accelerator.unwrap_model(transformer3d).config.patch_size
+                    _, _, _num_frames, _h_latent, _w_latent = latents.shape
+                    _tokens_per_frame = (_h_latent // _patch_size[1]) * (_w_latent // _patch_size[2])
+                    _noisy_anchor_frame_index = SINGLETURN_TAIL_START + args.singleturn_cache_corruption_frames
+                    latent_split_point = (_noisy_anchor_frame_index + 1) * _tokens_per_frame
                 # Predict the noise residual
                 with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
                     noise_pred = transformer3d(
@@ -2624,6 +2640,8 @@ def main():
                         seq_len=seq_len,
                         y=inpaint_latents if args.train_mode != "normal" else None,
                         clip_fea=clip_context if args.train_mode != "normal" else None,
+                        latent_split_point=latent_split_point,
+                        text_split_point=text_split_point,
                     )
                 
                 def custom_mse_loss(noise_pred, target, weighting=None, threshold=50, loss_mask=None):
