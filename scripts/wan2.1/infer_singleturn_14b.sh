@@ -20,6 +20,16 @@ export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_maskp
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
 export ENABLE_MASK_BLENDING=${ENABLE_MASK_BLENDING:-1}
+export MASK_BLEND_THRESHOLD=${MASK_BLEND_THRESHOLD:-0.5}
+export MASK_BLEND_DILATE_KERNEL_SIZE=${MASK_BLEND_DILATE_KERNEL_SIZE:-31}
+export MASK_BLEND_BLUR_KERNEL_SIZE=${MASK_BLEND_BLUR_KERNEL_SIZE:-15}
+export MASK_BLEND_BLUR_SIGMA=${MASK_BLEND_BLUR_SIGMA:-4.0}
+export ENABLE_UNCERTAINTY_VIZ=${ENABLE_UNCERTAINTY_VIZ:-0}
+export UNCERTAINTY_LAST_STEPS=${UNCERTAINTY_LAST_STEPS:-10}
+export ENABLE_TRAJECTORY_REFINEMENT=${ENABLE_TRAJECTORY_REFINEMENT:-0}
+export TRAJECTORY_REFINEMENT_REMAINING_STEPS=${TRAJECTORY_REFINEMENT_REMAINING_STEPS:-10}
+export TRAJECTORY_REFINEMENT_GAMMA=${TRAJECTORY_REFINEMENT_GAMMA:-}
+export TRAJECTORY_REFINEMENT_STRENGTH=${TRAJECTORY_REFINEMENT_STRENGTH:-1.0}
 export REFINEMENT_LORA_PATH=${REFINEMENT_LORA_PATH:-}
 export REFINEMENT_LORA_ALPHA=${REFINEMENT_LORA_ALPHA:-1.0}
 export REFINEMENT_GUIDANCE_SCALE=${REFINEMENT_GUIDANCE_SCALE:-1.0}
@@ -65,11 +75,36 @@ cmd_base=(
   --seed "$SEED"
   --fps "$FPS"
   --dtype "$DTYPE"
+  --mask_blend_threshold "$MASK_BLEND_THRESHOLD"
+  --mask_blend_dilate_kernel_size "$MASK_BLEND_DILATE_KERNEL_SIZE"
+  --mask_blend_blur_kernel_size "$MASK_BLEND_BLUR_KERNEL_SIZE"
+  --mask_blend_blur_sigma "$MASK_BLEND_BLUR_SIGMA"
+  --uncertainty_last_steps "$UNCERTAINTY_LAST_STEPS"
+  --trajectory_refinement_remaining_steps "$TRAJECTORY_REFINEMENT_REMAINING_STEPS"
+  --trajectory_refinement_strength "$TRAJECTORY_REFINEMENT_STRENGTH"
 )
 
 if [[ "${ENABLE_MASK_BLENDING}" == "1" ]]; then
   cmd_base+=(
     --enable_mask_blending
+  )
+fi
+
+if [[ "${ENABLE_UNCERTAINTY_VIZ}" == "1" ]]; then
+  cmd_base+=(
+    --enable_uncertainty_viz
+  )
+fi
+
+if [[ "${ENABLE_TRAJECTORY_REFINEMENT}" == "1" ]]; then
+  cmd_base+=(
+    --enable_trajectory_refinement
+  )
+fi
+
+if [[ -n "${TRAJECTORY_REFINEMENT_GAMMA}" ]]; then
+  cmd_base+=(
+    --trajectory_refinement_gamma "$TRAJECTORY_REFINEMENT_GAMMA"
   )
 fi
 

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -45,6 +46,7 @@ from videox_fun.utils.singleturn_utils import (
     preprocess_singleturn_mask_frame,
     preprocess_singleturn_mask,
     refine_singleturn_sample_from_latents,
+    save_singleturn_uncertainty_visuals,
     save_singleturn_outputs,
 )
 from videox_fun.utils.utils import filter_kwargs
@@ -154,13 +156,24 @@ def _save_singleturn_variant(
     fps: int,
 ):
     os.makedirs(output_dir, exist_ok=True)
-    return save_singleturn_outputs(
+    output_paths = save_singleturn_outputs(
         full_frames=generation["full_frames"],
         tail_frames=generation["tail_frames"],
         output_dir=output_dir,
         stem=stem,
         fps=fps,
     )
+    uncertainty_map = generation.get("uncertainty_map")
+    if uncertainty_map is not None:
+        output_paths.update(
+            save_singleturn_uncertainty_visuals(
+                uncertainty_map=uncertainty_map,
+                frames=generation["full_frames"][0],
+                output_dir=output_dir,
+                stem=stem,
+            )
+        )
+    return output_paths
 
 
 def _write_singleturn_metadata(
@@ -363,12 +376,54 @@ def _load_source_frame_for_blending(source_path: str, *, height: int, width: int
     return source.unsqueeze(0).unsqueeze(2)
 
 
+def _validate_odd_kernel_size(name: str, value: int) -> int:
+    value = int(value)
+    if value <= 0 or value % 2 == 0:
+        raise ValueError(f"{name} must be a positive odd integer, got {value}")
+    return value
+
+
+def _objectclear_style_blend_alpha(
+    alpha: torch.Tensor,
+    *,
+    threshold: float,
+    dilation_kernel_size: int,
+    blur_kernel_size: int,
+    blur_sigma: float,
+) -> torch.Tensor:
+    if alpha.ndim != 5 or alpha.shape[1] != 1 or alpha.shape[2] != 1:
+        raise ValueError(f"alpha must have shape (B, 1, 1, H, W), got {tuple(alpha.shape)}")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError(f"threshold must be in [0, 1], got {threshold}")
+    dilation_kernel_size = _validate_odd_kernel_size("dilation_kernel_size", dilation_kernel_size)
+    blur_kernel_size = _validate_odd_kernel_size("blur_kernel_size", blur_kernel_size)
+    if blur_sigma <= 0:
+        raise ValueError(f"blur_sigma must be positive, got {blur_sigma}")
+
+    alpha_2d = alpha[:, 0, 0].detach().cpu().numpy()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_kernel_size, dilation_kernel_size))
+    softened = []
+    for sample in alpha_2d:
+        binary = (sample >= threshold).astype(np.uint8)
+        dilated = cv2.dilate(binary, kernel, iterations=1).astype(np.float32)
+        blurred = cv2.GaussianBlur(dilated, (blur_kernel_size, blur_kernel_size), sigmaX=float(blur_sigma))
+        merged = np.maximum(binary.astype(np.float32), blurred)
+        softened.append(torch.from_numpy(merged))
+
+    softened_alpha = torch.stack(softened, dim=0).unsqueeze(1).unsqueeze(2)
+    return softened_alpha.to(device=alpha.device, dtype=alpha.dtype)
+
+
 def _save_singleturn_blended_last_frames(
     generation: dict,
     output_paths: dict,
     *,
     source_path: str,
     sample_size: tuple[int, int],
+    mask_blend_threshold: float,
+    mask_blend_dilate_kernel_size: int,
+    mask_blend_blur_kernel_size: int,
+    mask_blend_blur_sigma: float,
 ) -> None:
     if not source_path or not os.path.exists(source_path):
         return
@@ -386,6 +441,13 @@ def _save_singleturn_blended_last_frames(
     ).to(dtype=full_frames.dtype)
     alpha = full_frames[:, :, SINGLETURN_MASK_PREDICTION_FRAME_INDEX : SINGLETURN_MASK_PREDICTION_FRAME_INDEX + 1]
     alpha = alpha.mean(dim=1, keepdim=True).clamp(0, 1)
+    alpha = _objectclear_style_blend_alpha(
+        alpha,
+        threshold=mask_blend_threshold,
+        dilation_kernel_size=mask_blend_dilate_kernel_size,
+        blur_kernel_size=mask_blend_blur_kernel_size,
+        blur_sigma=mask_blend_blur_sigma,
+    )
 
     last_frame = full_frames[:, :, -1:]
     blended_last = alpha * last_frame + (1.0 - alpha) * source_frame
@@ -519,6 +581,14 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             generator=generator,
             weight_dtype=weight_dtype,
             total_frames=args.singleturn_total_frames,
+            enable_uncertainty_viz=args.enable_uncertainty_viz,
+            uncertainty_last_steps=args.uncertainty_last_steps,
+            enable_trajectory_refinement=args.enable_trajectory_refinement,
+            trajectory_refinement_remaining_steps=args.trajectory_refinement_remaining_steps,
+            trajectory_refinement_corruption_frames=args.singleturn_cache_corruption_frames,
+            trajectory_refinement_restoration_frames=args.singleturn_cache_restoration_frames,
+            trajectory_refinement_gamma=args.trajectory_refinement_gamma,
+            trajectory_refinement_strength=args.trajectory_refinement_strength,
         )
         refined_generation = None
         if args.enable_refinement:
@@ -566,6 +636,16 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             "sample_size": list(args.sample_size),
             "singleturn_total_frames": args.singleturn_total_frames,
             "mask_blending_enabled": bool(args.enable_mask_blending),
+            "mask_blend_threshold": args.mask_blend_threshold,
+            "mask_blend_dilate_kernel_size": args.mask_blend_dilate_kernel_size,
+            "mask_blend_blur_kernel_size": args.mask_blend_blur_kernel_size,
+            "mask_blend_blur_sigma": args.mask_blend_blur_sigma,
+            "uncertainty_viz_enabled": bool(args.enable_uncertainty_viz),
+            "uncertainty_last_steps": args.uncertainty_last_steps,
+            "trajectory_refinement_enabled": bool(args.enable_trajectory_refinement),
+            "trajectory_refinement_remaining_steps": args.trajectory_refinement_remaining_steps,
+            "trajectory_refinement_gamma": args.trajectory_refinement_gamma,
+            "trajectory_refinement_strength": args.trajectory_refinement_strength,
             "input_previews": preview_paths,
             "coarse_lora_path": args.lora_path or "",
             "coarse_lora_alpha": args.lora_alpha,
@@ -582,6 +662,10 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
             coarse_output_paths,
             source_path=args.image_path,
             sample_size=args.sample_size,
+            mask_blend_threshold=args.mask_blend_threshold,
+            mask_blend_dilate_kernel_size=args.mask_blend_dilate_kernel_size,
+            mask_blend_blur_kernel_size=args.mask_blend_blur_kernel_size,
+            mask_blend_blur_sigma=args.mask_blend_blur_sigma,
         )
         if refined_generation is not None and refined_output_paths is not None:
             _save_singleturn_blended_last_frames(
@@ -589,6 +673,10 @@ def _run_singleturn_image_mode(pipeline, args, weight_dtype, generator):
                 refined_output_paths,
                 source_path=args.image_path,
                 sample_size=args.sample_size,
+                mask_blend_threshold=args.mask_blend_threshold,
+                mask_blend_dilate_kernel_size=args.mask_blend_dilate_kernel_size,
+                mask_blend_blur_kernel_size=args.mask_blend_blur_kernel_size,
+                mask_blend_blur_sigma=args.mask_blend_blur_sigma,
             )
 
     return {
@@ -643,6 +731,14 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
                 generator=generator,
                 weight_dtype=weight_dtype,
                 total_frames=args.singleturn_total_frames,
+                enable_uncertainty_viz=args.enable_uncertainty_viz,
+                uncertainty_last_steps=args.uncertainty_last_steps,
+                enable_trajectory_refinement=args.enable_trajectory_refinement,
+                trajectory_refinement_remaining_steps=args.trajectory_refinement_remaining_steps,
+                trajectory_refinement_corruption_frames=args.singleturn_cache_corruption_frames,
+                trajectory_refinement_restoration_frames=args.singleturn_cache_restoration_frames,
+                trajectory_refinement_gamma=args.trajectory_refinement_gamma,
+                trajectory_refinement_strength=args.trajectory_refinement_strength,
             )
             refined_generation = None
             if args.enable_refinement:
@@ -707,6 +803,16 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
                 "original_size": list(original_size),
                 "singleturn_total_frames": args.singleturn_total_frames,
                 "mask_blending_enabled": bool(args.enable_mask_blending),
+                "mask_blend_threshold": args.mask_blend_threshold,
+                "mask_blend_dilate_kernel_size": args.mask_blend_dilate_kernel_size,
+                "mask_blend_blur_kernel_size": args.mask_blend_blur_kernel_size,
+                "mask_blend_blur_sigma": args.mask_blend_blur_sigma,
+                "uncertainty_viz_enabled": bool(args.enable_uncertainty_viz),
+                "uncertainty_last_steps": args.uncertainty_last_steps,
+                "trajectory_refinement_enabled": bool(args.enable_trajectory_refinement),
+                "trajectory_refinement_remaining_steps": args.trajectory_refinement_remaining_steps,
+                "trajectory_refinement_gamma": args.trajectory_refinement_gamma,
+                "trajectory_refinement_strength": args.trajectory_refinement_strength,
                 "input_previews": preview_paths,
                 "coarse_lora_path": args.lora_path or "",
                 "coarse_lora_alpha": args.lora_alpha,
@@ -723,6 +829,10 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
                 coarse_output_paths,
                 source_path=image_path,
                 sample_size=args.sample_size,
+                mask_blend_threshold=args.mask_blend_threshold,
+                mask_blend_dilate_kernel_size=args.mask_blend_dilate_kernel_size,
+                mask_blend_blur_kernel_size=args.mask_blend_blur_kernel_size,
+                mask_blend_blur_sigma=args.mask_blend_blur_sigma,
             )
             if refined_generation is not None and refined_output_paths is not None:
                 _save_singleturn_blended_last_frames(
@@ -730,6 +840,10 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
                     refined_output_paths,
                     source_path=image_path,
                     sample_size=args.sample_size,
+                    mask_blend_threshold=args.mask_blend_threshold,
+                    mask_blend_dilate_kernel_size=args.mask_blend_dilate_kernel_size,
+                    mask_blend_blur_kernel_size=args.mask_blend_blur_kernel_size,
+                    mask_blend_blur_sigma=args.mask_blend_blur_sigma,
                 )
         results.append(
             {
@@ -781,6 +895,14 @@ def _run_singleturn_cached_sample(
             generator=generator,
             weight_dtype=weight_dtype,
             total_frames=total_frames,
+            enable_uncertainty_viz=args.enable_uncertainty_viz,
+            uncertainty_last_steps=args.uncertainty_last_steps,
+            enable_trajectory_refinement=args.enable_trajectory_refinement,
+            trajectory_refinement_remaining_steps=args.trajectory_refinement_remaining_steps,
+            trajectory_refinement_corruption_frames=args.singleturn_cache_corruption_frames,
+            trajectory_refinement_restoration_frames=args.singleturn_cache_restoration_frames,
+            trajectory_refinement_gamma=args.trajectory_refinement_gamma,
+            trajectory_refinement_strength=args.trajectory_refinement_strength,
         )
         refined_generation = None
         if args.enable_refinement:
@@ -834,6 +956,16 @@ def _run_singleturn_cached_sample(
             "guidance_scale": args.guidance_scale,
             "singleturn_total_frames": total_frames,
             "mask_blending_enabled": bool(args.enable_mask_blending),
+            "mask_blend_threshold": args.mask_blend_threshold,
+            "mask_blend_dilate_kernel_size": args.mask_blend_dilate_kernel_size,
+            "mask_blend_blur_kernel_size": args.mask_blend_blur_kernel_size,
+            "mask_blend_blur_sigma": args.mask_blend_blur_sigma,
+            "uncertainty_viz_enabled": bool(args.enable_uncertainty_viz),
+            "uncertainty_last_steps": args.uncertainty_last_steps,
+            "trajectory_refinement_enabled": bool(args.enable_trajectory_refinement),
+            "trajectory_refinement_remaining_steps": args.trajectory_refinement_remaining_steps,
+            "trajectory_refinement_gamma": args.trajectory_refinement_gamma,
+            "trajectory_refinement_strength": args.trajectory_refinement_strength,
             "cache_mode": sample.get("cache_mode", ""),
             "mask_frame_image": mask_frame_path,
             "input_previews": preview_paths,
@@ -852,6 +984,10 @@ def _run_singleturn_cached_sample(
             coarse_output_paths,
             source_path=source_path,
             sample_size=args.sample_size,
+            mask_blend_threshold=args.mask_blend_threshold,
+            mask_blend_dilate_kernel_size=args.mask_blend_dilate_kernel_size,
+            mask_blend_blur_kernel_size=args.mask_blend_blur_kernel_size,
+            mask_blend_blur_sigma=args.mask_blend_blur_sigma,
         )
         if refined_generation is not None and refined_output_paths is not None:
             _save_singleturn_blended_last_frames(
@@ -859,6 +995,10 @@ def _run_singleturn_cached_sample(
                 refined_output_paths,
                 source_path=source_path,
                 sample_size=args.sample_size,
+                mask_blend_threshold=args.mask_blend_threshold,
+                mask_blend_dilate_kernel_size=args.mask_blend_dilate_kernel_size,
+                mask_blend_blur_kernel_size=args.mask_blend_blur_kernel_size,
+                mask_blend_blur_sigma=args.mask_blend_blur_sigma,
             )
 
     return {
@@ -1111,6 +1251,64 @@ def parse_args():
         action="store_true",
         help="Blend saved last-frame PNGs with the source image using the predicted mask frame as soft alpha.",
     )
+    parser.add_argument(
+        "--mask_blend_threshold",
+        type=float,
+        default=0.5,
+        help="Threshold applied to the predicted mask frame before ObjectClear-style blend alpha dilation.",
+    )
+    parser.add_argument(
+        "--mask_blend_dilate_kernel_size",
+        type=int,
+        default=31,
+        help="Odd elliptical dilation kernel size used for ObjectClear-style blend alpha.",
+    )
+    parser.add_argument(
+        "--mask_blend_blur_kernel_size",
+        type=int,
+        default=15,
+        help="Odd Gaussian blur kernel size used for ObjectClear-style blend alpha.",
+    )
+    parser.add_argument(
+        "--mask_blend_blur_sigma",
+        type=float,
+        default=4.0,
+        help="Gaussian sigma used for ObjectClear-style blend alpha.",
+    )
+    parser.add_argument(
+        "--enable_uncertainty_viz",
+        action="store_true",
+        help="Save experimental heatmap/overlay files from the last denoise-step latent update magnitudes.",
+    )
+    parser.add_argument(
+        "--uncertainty_last_steps",
+        type=int,
+        default=10,
+        help="Number of final denoise steps to average for --enable_uncertainty_viz.",
+    )
+    parser.add_argument(
+        "--enable_trajectory_refinement",
+        action="store_true",
+        help="Apply one test-time latent trajectory interpolation repair before the final denoise steps.",
+    )
+    parser.add_argument(
+        "--trajectory_refinement_remaining_steps",
+        type=int,
+        default=10,
+        help="Apply trajectory refinement when this many denoise steps remain.",
+    )
+    parser.add_argument(
+        "--trajectory_refinement_gamma",
+        type=float,
+        default=None,
+        help="Gamma for trajectory refinement interpolation. Defaults to --singleturn_cache_interpolation_gamma.",
+    )
+    parser.add_argument(
+        "--trajectory_refinement_strength",
+        type=float,
+        default=1.0,
+        help="Blend strength for trajectory refinement interpolation, where 1 fully replaces middle trajectory frames.",
+    )
     args = parser.parse_args()
 
     cache_mode = args.cached_sample_path is not None or args.cached_data_meta is not None
@@ -1156,6 +1354,16 @@ def parse_args():
         )
     if args.singleturn_cache_interpolation_gamma <= 0:
         raise ValueError("--singleturn_cache_interpolation_gamma must be positive.")
+    if args.uncertainty_last_steps <= 0:
+        raise ValueError("--uncertainty_last_steps must be positive.")
+    if args.trajectory_refinement_remaining_steps <= 0:
+        raise ValueError("--trajectory_refinement_remaining_steps must be positive.")
+    if args.trajectory_refinement_strength < 0:
+        raise ValueError("--trajectory_refinement_strength must be non-negative.")
+    if args.trajectory_refinement_gamma is None:
+        args.trajectory_refinement_gamma = args.singleturn_cache_interpolation_gamma
+    elif args.trajectory_refinement_gamma <= 0:
+        raise ValueError("--trajectory_refinement_gamma must be positive.")
 
     args.sample_size = normalize_singleturn_sample_size(args.sample_size)
     if any(dim % 16 != 0 for dim in args.sample_size):

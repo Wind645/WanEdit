@@ -19,6 +19,10 @@ export OUTPUT_DIR=${OUTPUT_DIR:-outputs/twomask_condition}
 export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/nonlin_gamma1_5/checkpoint-1000/lora_diffusion_pytorch_model.safetensors}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
+export MASK_BLEND_THRESHOLD=${MASK_BLEND_THRESHOLD:-0.5}
+export MASK_BLEND_DILATE_KERNEL_SIZE=${MASK_BLEND_DILATE_KERNEL_SIZE:-31}
+export MASK_BLEND_BLUR_KERNEL_SIZE=${MASK_BLEND_BLUR_KERNEL_SIZE:-15}
+export MASK_BLEND_BLUR_SIGMA=${MASK_BLEND_BLUR_SIGMA:-4.0}
 export REFINEMENT_LORA_PATH=${REFINEMENT_LORA_PATH:-}
 export REFINEMENT_LORA_ALPHA=${REFINEMENT_LORA_ALPHA:-1.0}
 export REFINEMENT_GUIDANCE_SCALE=${REFINEMENT_GUIDANCE_SCALE:-1.0}
@@ -64,6 +68,10 @@ cmd_base=(
   --seed "$SEED"
   --fps "$FPS"
   --dtype "$DTYPE"
+  --mask_blend_threshold "$MASK_BLEND_THRESHOLD"
+  --mask_blend_dilate_kernel_size "$MASK_BLEND_DILATE_KERNEL_SIZE"
+  --mask_blend_blur_kernel_size "$MASK_BLEND_BLUR_KERNEL_SIZE"
+  --mask_blend_blur_sigma "$MASK_BLEND_BLUR_SIGMA"
 )
 
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then

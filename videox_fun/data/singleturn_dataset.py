@@ -118,6 +118,29 @@ def _corne_dirs(data_root: str) -> tuple[Path, Path, Path, Path]:
     return shot_dir, bg_dir, mask_check_dir, mask_sam_dir
 
 
+def _has_corne_layout(data_root: str) -> bool:
+    root = Path(data_root)
+    return (root / "shot").is_dir() and (root / "bg").is_dir() and (root / "mask-check").is_dir()
+
+
+def _iter_objectclear_subset_dirs(data_root: str) -> Iterator[Path]:
+    root = Path(data_root)
+    for subset_dir in sorted(root.iterdir(), key=lambda item: item.name):
+        if not subset_dir.is_dir():
+            continue
+        if (
+            (subset_dir / "input").is_dir()
+            and (subset_dir / "gt").is_dir()
+            and (subset_dir / "object_effect_mask").is_dir()
+        ):
+            yield subset_dir
+
+
+def _has_objectclear_layout(data_root: str) -> bool:
+    root = Path(data_root)
+    return root.is_dir() and any(_iter_objectclear_subset_dirs(data_root))
+
+
 def _build_corne_record(
     shot_path: Path,
     bg_dir: Path,
@@ -144,6 +167,38 @@ def _build_corne_record(
     }
 
 
+def _build_objectclear_record(subset_dir: Path, input_path: Path) -> Optional[Dict[str, Any]]:
+    stem = input_path.stem
+    gt_path = _resolve_companion_file(subset_dir / "gt", stem)
+    mask_check_path = _resolve_companion_file(subset_dir / "object_effect_mask", stem)
+    if gt_path is None or mask_check_path is None:
+        return None
+
+    mask_sam_path = _resolve_companion_file(subset_dir / "object_mask", stem)
+    used_mask_sam = mask_sam_path is not None
+    return {
+        "source_image": str(input_path),
+        "bg_image": str(gt_path),
+        "mask_check_image": str(mask_check_path),
+        "mask_sam_image": str(mask_sam_path) if mask_sam_path is not None else None,
+        "used_mask_sam": used_mask_sam,
+        "mask_frame_image": str(mask_sam_path if used_mask_sam else mask_check_path),
+        "type": "image",
+        "file_path": str(input_path),
+        "dataset_type": "objectclear_object_removal",
+        "subset": subset_dir.name,
+    }
+
+
+def _iter_objectclear_records(data_root: str) -> Iterator[Dict[str, Any]]:
+    for subset_dir in _iter_objectclear_subset_dirs(data_root):
+        input_dir = subset_dir / "input"
+        for input_path in _iter_image_files(input_dir):
+            record = _build_objectclear_record(subset_dir, input_path)
+            if record is not None:
+                yield record
+
+
 def discover_singleturn_records(
     data_root: str,
     manifest_path: Optional[str] = None,
@@ -154,16 +209,26 @@ def discover_singleturn_records(
             "Point --train_data_dir at the CORNE root instead."
         )
 
-    shot_dir, bg_dir, mask_check_dir, mask_sam_dir = _corne_dirs(data_root)
     records: List[Dict[str, Any]] = []
-    for shot_path in _iter_image_files(shot_dir):
-        record = _build_corne_record(shot_path, bg_dir, mask_check_dir, mask_sam_dir)
-        if record is not None:
-            records.append(record)
+    if _has_corne_layout(data_root):
+        shot_dir, bg_dir, mask_check_dir, mask_sam_dir = _corne_dirs(data_root)
+        for shot_path in _iter_image_files(shot_dir):
+            record = _build_corne_record(shot_path, bg_dir, mask_check_dir, mask_sam_dir)
+            if record is not None:
+                record["dataset_type"] = "corne_object_removal"
+                records.append(record)
+    elif _has_objectclear_layout(data_root):
+        records.extend(_iter_objectclear_records(data_root))
+    else:
+        raise ValueError(
+            "SingleTurn object-removal data root must either contain CORNE shot/, bg/, mask-check/ directories "
+            "or ObjectClear subset directories containing input/, gt/, object_effect_mask/, and optional object_mask/. "
+            f"Got data_root={data_root}"
+        )
 
     if not records:
         raise ValueError(
-            "No valid CORNE object-removal samples were found. Each sample basename must exist in shot/, bg/, and mask-check/."
+            "No valid SingleTurn object-removal samples were found. Each sample basename must have source, target, and mask files."
         )
     return records
 
@@ -200,6 +265,12 @@ class SingleTurnEditDataset(Dataset):
                 add_batch_dim=False,
                 add_frame_dim=True,
             ),
+            "pixel_values_mask_check_frame": preprocess_singleturn_mask_frame(
+                record["mask_check_image"],
+                self.video_sample_size,
+                add_batch_dim=False,
+                add_frame_dim=True,
+            ),
             "pixel_values_tgt_image": preprocess_singleturn_image(
                 record["bg_image"],
                 self.video_sample_size,
@@ -219,6 +290,8 @@ class SingleTurnEditDataset(Dataset):
             "mask_frame_image": record["mask_frame_image"],
             "mask_sam_image": record["mask_sam_image"] or "",
             "used_mask_sam": bool(record["used_mask_sam"]),
+            "dataset_type": record.get("dataset_type", "corne_object_removal"),
+            "subset": record.get("subset", ""),
             "data_type": "image",
             "idx": idx,
         }
@@ -252,7 +325,20 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
         self.num_samples_with_mask_sam = 0
         self.num_samples_without_mask_sam = 0
         self.stopped_early_when_quotas_met = False
-        self._shot_dir, self._bg_dir, self._mask_check_dir, self._mask_sam_dir = _corne_dirs(data_root)
+        if _has_corne_layout(data_root):
+            self.layout = "corne"
+            self.dataset_type = "corne_object_removal"
+            self._shot_dir, self._bg_dir, self._mask_check_dir, self._mask_sam_dir = _corne_dirs(data_root)
+        elif _has_objectclear_layout(data_root):
+            self.layout = "objectclear"
+            self.dataset_type = "objectclear_object_removal"
+            self._shot_dir = self._bg_dir = self._mask_check_dir = self._mask_sam_dir = None
+        else:
+            raise ValueError(
+                "SingleTurn object-removal preprocess root must either contain CORNE shot/, bg/, mask-check/ directories "
+                "or ObjectClear subset directories containing input/, gt/, object_effect_mask/, and optional object_mask/. "
+                f"Got data_root={data_root}"
+            )
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -270,7 +356,15 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
         remaining_skip_with_mask_sam = self.skip_samples_with_mask_sam
         remaining_skip_without_mask_sam = self.skip_samples_without_mask_sam
 
-        for global_index, shot_path in enumerate(_iter_image_files(self._shot_dir)):
+        if self.layout == "corne":
+            record_iter = (
+                _build_corne_record(shot_path, self._bg_dir, self._mask_check_dir, self._mask_sam_dir)
+                for shot_path in _iter_image_files(self._shot_dir)
+            )
+        else:
+            record_iter = _iter_objectclear_records(self.data_root)
+
+        for global_index, record in enumerate(record_iter):
             if (
                 self.num_samples_with_mask_sam >= self.max_samples_with_mask_sam
                 and self.num_samples_without_mask_sam >= self.max_samples_without_mask_sam
@@ -278,9 +372,9 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
                 self.stopped_early_when_quotas_met = True
                 break
 
-            record = _build_corne_record(shot_path, self._bg_dir, self._mask_check_dir, self._mask_sam_dir)
             if record is None:
                 continue
+            record.setdefault("dataset_type", self.dataset_type)
 
             used_mask_sam = bool(record["used_mask_sam"])
             if used_mask_sam:
@@ -311,6 +405,12 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
                     add_batch_dim=False,
                     add_frame_dim=True,
                 ),
+                "pixel_values_mask_check_frame": preprocess_singleturn_mask_frame(
+                    record["mask_check_image"],
+                    self.sample_size,
+                    add_batch_dim=False,
+                    add_frame_dim=True,
+                ),
                 "pixel_values_tgt_image": preprocess_singleturn_image(
                     record["bg_image"],
                     self.sample_size,
@@ -330,6 +430,8 @@ class SingleTurnPreprocessIterableDataset(IterableDataset):
                 "mask_frame_image": record["mask_frame_image"],
                 "mask_sam_image": record["mask_sam_image"] or "",
                 "used_mask_sam": used_mask_sam,
+                "dataset_type": record["dataset_type"],
+                "subset": record.get("subset", ""),
                 "global_index": global_index,
                 "row_index": -1,
             }

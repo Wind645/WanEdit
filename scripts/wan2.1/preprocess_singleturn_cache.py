@@ -6,10 +6,12 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+from PIL import Image, ImageDraw
 
 current_file_path = os.path.abspath(__file__)
 project_roots = [
@@ -27,9 +29,9 @@ from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
     SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
     SINGLETURN_TOTAL_FRAMES,
-    build_singleturn_edge_weight_map,
-    build_singleturn_object_removal_latents,
     normalize_singleturn_sample_size,
+    preprocess_singleturn_mask,
+    preprocess_singleturn_mask_frame,
     resize_singleturn_mask_to_latent_grid,
 )
 
@@ -51,9 +53,17 @@ def resolve_model_path(model_root, subpath, default_subpath):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Precompute CORNE SingleTurn 8-frame two-prefix object-removal cache.")
+    parser = argparse.ArgumentParser(description="Precompute SingleTurn 8-frame two-prefix object-removal cache.")
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True, help="Base Wan model path.")
-    parser.add_argument("--train_data_dir", type=str, required=True, help="CORNE_extracted root containing shot/, bg/, mask-check/, and optional mask_sam/.")
+    parser.add_argument(
+        "--train_data_dir",
+        type=str,
+        required=True,
+        help=(
+            "Object-removal root. Supports CORNE shot/, bg/, mask-check/, optional mask_sam/; "
+            "or ObjectClear subset dirs with input/, gt/, object_effect_mask/, optional object_mask/."
+        ),
+    )
     parser.add_argument("--train_data_manifest", type=str, default=None, help="Deprecated and unsupported for CORNE object-removal mode.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to write cached tensors and manifest.")
     parser.add_argument("--config_path", type=str, default="config/wan2.1/wan_civitai.yaml", help="Wan config path.")
@@ -71,9 +81,9 @@ def parse_args():
     args = parser.parse_args()
 
     if args.train_data_manifest is not None:
-        raise ValueError("CORNE object-removal preprocess no longer supports --train_data_manifest.")
+        raise ValueError("SingleTurn object-removal preprocess no longer supports --train_data_manifest.")
     if args.num_workers != 0:
-        raise ValueError("CORNE object-removal preprocess requires --num_workers 0 to preserve class quotas exactly.")
+        raise ValueError("SingleTurn object-removal preprocess requires --num_workers 0 to preserve class quotas exactly.")
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive.")
     if (
@@ -103,14 +113,75 @@ def get_weight_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
     return torch.bfloat16
 
 
-def build_cache_name(global_index: int, source_image: str) -> str:
-    return f"{int(global_index):06d}_{Path(str(source_image)).stem}.pt"
+def build_cache_variant_name(global_index: int, source_image: str, variant: str) -> str:
+    base = f"{int(global_index):06d}_{Path(str(source_image)).stem}"
+    if variant and variant != "normal":
+        return f"{base}__{variant}.pt"
+    return f"{base}.pt"
+
+
+def build_generated_mask_path(output_dir: Path, global_index: int, source_image: str, variant: str) -> Path:
+    return output_dir / "generated_masks" / variant / f"{int(global_index):06d}_{Path(str(source_image)).stem}.png"
+
+
+def _load_grayscale_mask(path: str) -> Image.Image:
+    return Image.open(path).convert("L")
+
+
+def _polygon_union_mask(mask_size: tuple[int, int], points: list[tuple[float, float]], fg: np.ndarray) -> Image.Image:
+    coarse = Image.new("L", mask_size, 0)
+    ImageDraw.Draw(coarse).polygon(points, outline=255, fill=255)
+    return Image.fromarray(np.maximum(np.asarray(coarse, dtype=np.uint8), fg.astype(np.uint8) * 255), mode="L")
+
+
+def _generate_coarse_mask(mask_image: Image.Image, seed: int, *, max_attempts: int = 16) -> Image.Image | None:
+    mask = mask_image.convert("L")
+    mask_arr = np.asarray(mask, dtype=np.uint8)
+    fg = mask_arr > 127
+    if not fg.any():
+        return None
+
+    rng = np.random.default_rng(int(seed))
+    ys, xs = np.where(fg)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    w = max(1, x1 - x0 + 1)
+    h = max(1, y1 - y0 + 1)
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+
+    source_area = max(1, int(fg.sum()))
+    max_area_ratio = 2.5
+    min_area_ratio = 1.15
+    for _ in range(max(1, int(max_attempts))):
+        expand_x = float(rng.uniform(1.05, 1.28))
+        expand_y = float(rng.uniform(1.05, 1.28))
+        rx = max(4.0, 0.5 * w * expand_x)
+        ry = max(4.0, 0.5 * h * expand_y)
+        num_vertices = int(rng.integers(7, 11))
+        angle_offset = float(rng.uniform(0.0, 2.0 * np.pi))
+        points = []
+        for vertex_idx in range(num_vertices):
+            theta = angle_offset + (2.0 * np.pi * vertex_idx / float(num_vertices)) + float(rng.uniform(-0.1, 0.1))
+            radial_scale = float(rng.uniform(0.92, 1.08))
+            px = cx + np.cos(theta) * rx * radial_scale
+            py = cy + np.sin(theta) * ry * radial_scale
+            points.append((px, py))
+
+        coarse = _polygon_union_mask(mask.size, points, fg)
+        coarse_area = int((np.asarray(coarse) > 127).sum())
+        area_ratio = coarse_area / float(source_area)
+        if min_area_ratio <= area_ratio <= max_area_ratio:
+            return coarse
+    return None
 
 
 def build_manifest_entry(cache_path: Path, output_dir: Path, sample: dict) -> dict:
     entry = {
         "cache_path": str(cache_path.relative_to(output_dir)),
         "mode": "singleturn_object_removal_v2",
+        "dataset_type": sample.get("dataset_type", "corne_object_removal"),
+        "variant": sample.get("variant", "normal"),
         "source_image": sample["source_image"],
         "bg_image": sample["bg_image"],
         "mask_check_image": sample["mask_check_image"],
@@ -118,9 +189,15 @@ def build_manifest_entry(cache_path: Path, output_dir: Path, sample: dict) -> di
         "used_mask_sam": bool(sample["used_mask_sam"]),
         "global_index": int(sample["global_index"]),
     }
+    subset = sample.get("subset", "")
+    if subset:
+        entry["subset"] = subset
     mask_sam_image = sample.get("mask_sam_image", "")
     if mask_sam_image:
         entry["mask_sam_image"] = mask_sam_image
+    generated_mask_image = sample.get("generated_mask_image", "")
+    if generated_mask_image:
+        entry["generated_mask_image"] = generated_mask_image
     return entry
 
 
@@ -154,6 +231,11 @@ def _flush_batch(
         dtype=weight_dtype,
         non_blocking=True,
     )
+    mask_check_frame_batch = _stack_batch_tensors(batch_records, "pixel_values_mask_check_frame").to(
+        device=device,
+        dtype=weight_dtype,
+        non_blocking=True,
+    )
     bg_batch = _stack_batch_tensors(batch_records, "pixel_values_tgt_image").to(
         device=device,
         dtype=weight_dtype,
@@ -167,49 +249,163 @@ def _flush_batch(
 
     with torch.no_grad():
         mask_frame_latents = vae.encode(mask_frame_batch.permute(0, 2, 1, 3, 4))[0].mode()
+        mask_check_frame_latents = vae.encode(mask_check_frame_batch.permute(0, 2, 1, 3, 4))[0].mode()
         source_frame_latents = vae.encode(source_batch.permute(0, 2, 1, 3, 4))[0].mode()
         bg_latents = vae.encode(bg_batch.permute(0, 2, 1, 3, 4))[0].mode()
         latent_mask = resize_singleturn_mask_to_latent_grid(mask_check_batch, source_frame_latents)
         noise_latents = torch.randn_like(source_frame_latents)
-        edge_weight_map = build_singleturn_edge_weight_map(latent_mask)
-        full_latents = build_singleturn_object_removal_latents(
-            mask_frame_latent=mask_frame_latents,
-            source_frame_latent=source_frame_latents,
-            bg_latent=bg_latents,
-            mask_check_latent=latent_mask,
-            noise_latent=noise_latents,
+        noisy_anchor_latents = torch.where(
+            latent_mask.to(dtype=torch.bool).expand_as(source_frame_latents),
+            noise_latents,
+            source_frame_latents,
         )
 
+    coarse_variant_enabled = any(record.get("dataset_type") == "objectclear_object_removal" for record in batch_records)
+    coarse_mask_frame_batch = None
+    coarse_mask_latents = None
+    coarse_noisy_anchor_latents = None
+    coarse_mask_paths: list[str | None] = []
+    coarse_valid_offsets: list[int] = []
+    if coarse_variant_enabled:
+        coarse_mask_frame_tensors = []
+        coarse_mask_binary_tensors = []
+        for local_offset, record in enumerate(batch_records):
+            global_index = int(record["global_index"])
+            seed = global_index
+            coarse_path = build_generated_mask_path(output_dir, global_index, record["source_image"], "coarse")
+            coarse_path.parent.mkdir(parents=True, exist_ok=True)
+            coarse_mask = _generate_coarse_mask(
+                _load_grayscale_mask(record["mask_check_image"]),
+                seed=seed,
+            )
+            if coarse_mask is None:
+                coarse_mask_paths.append(None)
+                continue
+            coarse_mask.save(coarse_path)
+            coarse_mask_paths.append(str(coarse_path))
+            coarse_valid_offsets.append(local_offset)
+            coarse_mask_frame_tensors.append(
+                preprocess_singleturn_mask_frame(
+                    coarse_mask,
+                    singleturn_sample_size,
+                    add_batch_dim=False,
+                    add_frame_dim=True,
+                )
+            )
+            coarse_mask_binary_tensors.append(
+                preprocess_singleturn_mask(
+                    coarse_mask,
+                    singleturn_sample_size,
+                    add_batch_dim=False,
+                    add_frame_dim=True,
+                )
+            )
+        if coarse_mask_frame_tensors:
+            coarse_mask_frame_batch = torch.stack(coarse_mask_frame_tensors, dim=0).to(
+                device=device,
+                dtype=weight_dtype,
+                non_blocking=True,
+            )
+            coarse_mask_binary_batch = torch.stack(coarse_mask_binary_tensors, dim=0).to(
+                device=device,
+                dtype=weight_dtype,
+                non_blocking=True,
+            )
+            source_valid_latents = source_frame_latents[coarse_valid_offsets]
+            noise_valid_latents = noise_latents[coarse_valid_offsets]
+            with torch.no_grad():
+                coarse_mask_latents = vae.encode(coarse_mask_frame_batch.permute(0, 2, 1, 3, 4))[0].mode()
+                coarse_latent_mask = resize_singleturn_mask_to_latent_grid(coarse_mask_binary_batch, source_valid_latents)
+                coarse_noisy_anchor_latents = torch.where(
+                    coarse_latent_mask.to(dtype=torch.bool).expand_as(source_valid_latents),
+                    noise_valid_latents,
+                    source_valid_latents,
+                )
+            coarse_index_by_offset = {offset: idx for idx, offset in enumerate(coarse_valid_offsets)}
+        else:
+            coarse_index_by_offset = {}
+    else:
+        coarse_index_by_offset = {}
+
+    written = 0
     for local_offset, record in enumerate(batch_records):
-        cache_path = cache_dir / build_cache_name(int(record["global_index"]), record["source_image"])
-        if cache_path.exists() and not overwrite:
-            raise FileExistsError(f"Cache file already exists: {cache_path}. Use --overwrite to replace it.")
+        variants = [("normal", record["mask_check_image"], record["mask_frame_image"], record.get("mask_sam_image", ""), bool(record["used_mask_sam"]), mask_check_frame_latents[local_offset], mask_frame_latents[local_offset])]
+        coarse_mask_path = coarse_mask_paths[local_offset] if coarse_variant_enabled else None
+        coarse_encoded_idx = coarse_index_by_offset.get(local_offset)
+        if coarse_mask_path is not None and coarse_encoded_idx is not None:
+            variants.append(
+                (
+                    "coarse",
+                    coarse_mask_path,
+                    coarse_mask_path,
+                    coarse_mask_path,
+                    True,
+                    coarse_mask_latents[coarse_encoded_idx],
+                    coarse_mask_latents[coarse_encoded_idx],
+                    coarse_noisy_anchor_latents[coarse_encoded_idx],
+                )
+            )
 
-        payload = {
-            "mode": "singleturn_object_removal_v2",
-            "dataset_type": "corne_object_removal",
-            "full_latents": full_latents[local_offset].detach().cpu().to(weight_dtype),
-            "mask_frame_latent": mask_frame_latents[local_offset].detach().cpu().to(weight_dtype),
-            "source_frame_latent": source_frame_latents[local_offset].detach().cpu().to(weight_dtype),
-            "edge_weight_map": edge_weight_map[local_offset].detach().cpu().to(weight_dtype),
-            "source_image": record["source_image"],
-            "bg_image": record["bg_image"],
-            "mask_check_image": record["mask_check_image"],
-            "mask_frame_image": record["mask_frame_image"],
-            "used_mask_sam": bool(record["used_mask_sam"]),
-            "singleturn_sample_size": list(singleturn_sample_size),
-            "shared_prompt_cache": str(shared_prompt_path.relative_to(output_dir)),
-            "text": CORNE_SINGLETURN_PROMPT,
-            "formatted_text": CORNE_SINGLETURN_PROMPT,
-        }
-        mask_sam_image = record.get("mask_sam_image", "")
-        if mask_sam_image:
-            payload["mask_sam_image"] = mask_sam_image
+        for variant_item in variants:
+            if len(variant_item) == 7:
+                (
+                    variant_name,
+                    mask_check_image,
+                    mask_frame_image,
+                    mask_sam_image,
+                    used_mask_sam,
+                    mask_check_latent,
+                    mask_frame_latent,
+                ) = variant_item
+                noisy_anchor_latent = noisy_anchor_latents[local_offset]
+            else:
+                (
+                    variant_name,
+                    mask_check_image,
+                    mask_frame_image,
+                    mask_sam_image,
+                    used_mask_sam,
+                    mask_check_latent,
+                    mask_frame_latent,
+                    noisy_anchor_latent,
+                ) = variant_item
+            cache_path = cache_dir / build_cache_variant_name(int(record["global_index"]), record["source_image"], variant_name)
+            if cache_path.exists() and not overwrite:
+                raise FileExistsError(f"Cache file already exists: {cache_path}. Use --overwrite to replace it.")
 
-        torch.save(payload, cache_path)
-        manifest.append(build_manifest_entry(cache_path, output_dir, record))
+            payload = {
+                "mode": "singleturn_object_removal_v2",
+                "dataset_type": record.get("dataset_type", "corne_object_removal"),
+                "variant": variant_name,
+                "mask_frame_latent": mask_frame_latent.detach().cpu().to(weight_dtype),
+                "mask_check_latent": mask_check_latent.detach().cpu().to(weight_dtype),
+                "source_frame_latent": source_frame_latents[local_offset].detach().cpu().to(weight_dtype),
+                "noisy_anchor_latent": noisy_anchor_latent.detach().cpu().to(weight_dtype),
+                "target_latent": bg_latents[local_offset].detach().cpu().to(weight_dtype),
+                "source_image": record["source_image"],
+                "bg_image": record["bg_image"],
+                "mask_check_image": mask_check_image,
+                "mask_frame_image": mask_frame_image,
+                "used_mask_sam": bool(used_mask_sam),
+                "singleturn_sample_size": list(singleturn_sample_size),
+                "shared_prompt_cache": str(shared_prompt_path.relative_to(output_dir)),
+                "text": CORNE_SINGLETURN_PROMPT,
+                "formatted_text": CORNE_SINGLETURN_PROMPT,
+            }
+            subset = record.get("subset", "")
+            if subset:
+                payload["subset"] = subset
+            if mask_sam_image:
+                payload["mask_sam_image"] = mask_sam_image
+                payload["mask_sam_latent"] = mask_frame_latent.detach().cpu().to(weight_dtype)
+            if variant_name == "coarse":
+                payload["generated_mask_image"] = mask_check_image
 
-    return len(batch_records)
+            torch.save(payload, cache_path)
+            manifest.append(build_manifest_entry(cache_path, output_dir, {**record, "variant": variant_name, "mask_check_image": mask_check_image, "mask_frame_image": mask_frame_image, "mask_sam_image": mask_sam_image, "used_mask_sam": used_mask_sam, "generated_mask_image": mask_check_image}))
+            written += 1
+
+    return written
 
 
 def main():
@@ -289,11 +485,12 @@ def main():
         skip_samples_with_mask_sam=args.skip_samples_with_mask_sam,
         skip_samples_without_mask_sam=args.skip_samples_without_mask_sam,
     )
+    dataset_type = getattr(preprocess_dataset, "dataset_type", "corne_object_removal")
 
     manifest: list[dict] = []
     batch_records: list[dict] = []
     generated_samples = 0
-    progress_bar = tqdm(desc="Preprocessing CORNE SingleTurn cache")
+    progress_bar = tqdm(desc=f"Preprocessing {dataset_type} SingleTurn cache")
 
     for sample in preprocess_dataset:
         batch_records.append(sample)
@@ -337,13 +534,21 @@ def main():
 
     progress_bar.close()
 
+    num_normal_samples = sum(1 for entry in manifest if entry.get("variant", "normal") == "normal")
+    num_coarse_samples = sum(1 for entry in manifest if entry.get("variant") == "coarse")
+
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
     metadata = {
         "mode": "singleturn_object_removal_v2",
-        "dataset_type": "corne_object_removal",
+        "dataset_type": dataset_type,
         "conditioning_format": "8-frame 2-prefix mask-latent + clean-source-latent",
+        "mask_check_source": "object_effect_mask" if dataset_type == "objectclear_object_removal" else "mask-check",
+        "mask_sam_source": "object_mask" if dataset_type == "objectclear_object_removal" else "mask_sam",
+        "variants": ["normal", "coarse"] if dataset_type == "objectclear_object_removal" else ["normal"],
+        "coarse_mask_source": "object_effect_mask" if dataset_type == "objectclear_object_removal" else "",
+        "coarse_mask_root": "generated_masks/coarse" if dataset_type == "objectclear_object_removal" else "",
         "prefix_frames": SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES,
         "total_frames": SINGLETURN_TOTAL_FRAMES,
         "pixel_space_source_masking": False,
@@ -355,6 +560,9 @@ def main():
         "num_samples_without_mask_sam": preprocess_dataset.num_samples_without_mask_sam,
         "stopped_early_when_quotas_met": bool(preprocess_dataset.stopped_early_when_quotas_met),
         "num_samples_total": generated_samples,
+        "num_original_samples": preprocess_dataset.num_samples_with_mask_sam + preprocess_dataset.num_samples_without_mask_sam,
+        "num_normal_samples": num_normal_samples,
+        "num_coarse_samples": num_coarse_samples,
         "singleturn_sample_size": list(args.singleturn_sample_size),
         "shared_prompt_text": CORNE_SINGLETURN_PROMPT,
         "shared_prompt_cache": str(shared_prompt_path.relative_to(output_dir)),
@@ -370,8 +578,12 @@ def main():
                 "metadata_path": str(metadata_path),
                 "shared_prompt_cache": str(shared_prompt_path),
                 "num_samples_total": generated_samples,
+                "num_normal_samples": num_normal_samples,
+                "num_coarse_samples": num_coarse_samples,
                 "num_samples_with_mask_sam": preprocess_dataset.num_samples_with_mask_sam,
                 "num_samples_without_mask_sam": preprocess_dataset.num_samples_without_mask_sam,
+                "dataset_type": dataset_type,
+                "variants": ["normal", "coarse"] if dataset_type == "objectclear_object_removal" else ["normal"],
                 "skip_samples_with_mask_sam": args.skip_samples_with_mask_sam,
                 "skip_samples_without_mask_sam": args.skip_samples_without_mask_sam,
             },

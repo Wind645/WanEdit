@@ -341,6 +341,60 @@ def build_singleturn_object_removal_latents(
     return torch.cat(frames, dim=2)
 
 
+def apply_singleturn_trajectory_refinement(
+    latents: torch.Tensor,
+    *,
+    corruption_frames: int = SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES,
+    restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
+    interpolation_gamma: float = 2.0,
+    strength: float = 1.0,
+) -> torch.Tensor:
+    if latents.ndim != 5:
+        raise ValueError(f"latents must have shape (B, C, T, H, W), got {tuple(latents.shape)}")
+    corruption_frames = int(corruption_frames)
+    restoration_frames = int(restoration_frames)
+    expected_total_frames = compute_singleturn_object_removal_total_frames(corruption_frames, restoration_frames)
+    if latents.shape[2] != expected_total_frames:
+        raise ValueError(
+            f"trajectory refinement expects {expected_total_frames} frames for corruption/restoration layout, "
+            f"got {latents.shape[2]}."
+        )
+    if interpolation_gamma <= 0:
+        raise ValueError(f"interpolation_gamma must be positive, got {interpolation_gamma}")
+    strength = float(strength)
+    if strength <= 0:
+        return latents
+
+    refined = latents.clone()
+    source_latent = latents[:, :, SINGLETURN_SOURCE_CONDITION_FRAME_INDEX : SINGLETURN_SOURCE_CONDITION_FRAME_INDEX + 1]
+    anchor_index = SINGLETURN_TAIL_START + corruption_frames
+    noisy_anchor_latent = latents[:, :, anchor_index : anchor_index + 1]
+    final_latent = latents[:, :, -1:]
+
+    for frame_idx in range(1, corruption_frames + 1):
+        alpha = (float(frame_idx) / float(corruption_frames + 1)) ** float(interpolation_gamma)
+        target_index = SINGLETURN_TAIL_START + frame_idx - 1
+        target_latent = _interp(source_latent, noisy_anchor_latent, alpha)
+        refined[:, :, target_index : target_index + 1] = torch.lerp(
+            latents[:, :, target_index : target_index + 1],
+            target_latent,
+            min(1.0, strength),
+        )
+
+    for frame_idx in range(1, restoration_frames + 1):
+        progress = float(frame_idx) / float(restoration_frames + 1)
+        alpha = 1.0 - (1.0 - progress) ** float(interpolation_gamma)
+        target_index = anchor_index + frame_idx
+        target_latent = _interp(noisy_anchor_latent, final_latent, alpha)
+        refined[:, :, target_index : target_index + 1] = torch.lerp(
+            latents[:, :, target_index : target_index + 1],
+            target_latent,
+            min(1.0, strength),
+        )
+
+    return refined
+
+
 def build_singleturn_edge_weight_map(
     mask_check_latent: torch.Tensor,
     *,
@@ -656,6 +710,14 @@ def _run_singleturn_generation(
     generator: Optional[torch.Generator] = None,
     weight_dtype: Optional[torch.dtype] = None,
     total_frames: int = SINGLETURN_TOTAL_FRAMES,
+    enable_uncertainty_viz: bool = False,
+    uncertainty_last_steps: int = 10,
+    enable_trajectory_refinement: bool = False,
+    trajectory_refinement_remaining_steps: int = 10,
+    trajectory_refinement_corruption_frames: int = SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES,
+    trajectory_refinement_restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
+    trajectory_refinement_gamma: float = 2.0,
+    trajectory_refinement_strength: float = 1.0,
 ):
     device = pipeline._execution_device
     do_classifier_free_guidance = guidance_scale > 1.0
@@ -723,13 +785,33 @@ def _run_singleturn_generation(
         total_frames=total_frames,
     )
     seq_len = compute_wan_seq_len_from_latents(latents, pipeline.transformer.config.patch_size)
+    uncertainty_deltas = []
+    uncertainty_last_steps = max(1, int(uncertainty_last_steps))
+    trajectory_refinement_remaining_steps = max(1, int(trajectory_refinement_remaining_steps))
+    trajectory_refinement_applied = False
 
     def autocast_context():
         if device.type == "cuda" and weight_dtype != torch.float32:
             return torch.autocast("cuda", dtype=weight_dtype)
         return contextlib.nullcontext()
 
-    for timestep in timesteps:
+    for step_index, timestep in enumerate(timesteps):
+        remaining_steps = len(timesteps) - step_index
+        if (
+            enable_trajectory_refinement
+            and not trajectory_refinement_applied
+            and remaining_steps == trajectory_refinement_remaining_steps
+        ):
+            latents = apply_singleturn_trajectory_refinement(
+                latents,
+                corruption_frames=trajectory_refinement_corruption_frames,
+                restoration_frames=trajectory_refinement_restoration_frames,
+                interpolation_gamma=trajectory_refinement_gamma,
+                strength=trajectory_refinement_strength,
+            )
+            trajectory_refinement_applied = True
+
+        latents_before_step = latents.clone() if enable_uncertainty_viz else None
         latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
         if hasattr(pipeline.scheduler, "scale_model_input"):
             latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, timestep)
@@ -759,15 +841,23 @@ def _run_singleturn_generation(
         )[0]
         latents = latents.clone()
         latents[:, :, condition_frame_indices] = frozen_condition
+        if enable_uncertainty_viz:
+            latent_delta = (latents - latents_before_step).float().norm(p=2, dim=1)
+            uncertainty_deltas.append(latent_delta[0].detach().cpu())
+            if len(uncertainty_deltas) > uncertainty_last_steps:
+                uncertainty_deltas.pop(0)
 
     full_frames = decode_singleturn_latent_frames(pipeline.vae, latents, decode_dtype=weight_dtype).cpu()
     tail_frames = full_frames[:, :, SINGLETURN_TAIL_START:].contiguous()
-    return {
+    generation = {
         "formatted_prompt": CORNE_SINGLETURN_PROMPT,
         "full_frames": full_frames,
         "tail_frames": tail_frames,
         "latents": latents.detach().cpu(),
     }
+    if enable_uncertainty_viz and uncertainty_deltas:
+        generation["uncertainty_map"] = torch.stack(uncertainty_deltas, dim=0).mean(dim=0)
+    return generation
 
 
 def generate_singleturn_sample(
@@ -783,6 +873,14 @@ def generate_singleturn_sample(
     weight_dtype: Optional[torch.dtype] = None,
     max_sequence_length: int = 512,
     total_frames: int = SINGLETURN_OBJECT_REMOVAL_DENSIFIED_TOTAL_FRAMES,
+    enable_uncertainty_viz: bool = False,
+    uncertainty_last_steps: int = 10,
+    enable_trajectory_refinement: bool = False,
+    trajectory_refinement_remaining_steps: int = 10,
+    trajectory_refinement_corruption_frames: int = SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES,
+    trajectory_refinement_restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
+    trajectory_refinement_gamma: float = 2.0,
+    trajectory_refinement_strength: float = 1.0,
 ):
     del prompt
     del prompt_template
@@ -808,6 +906,14 @@ def generate_singleturn_sample(
         generator=generator,
         weight_dtype=weight_dtype,
         total_frames=total_frames,
+        enable_uncertainty_viz=enable_uncertainty_viz,
+        uncertainty_last_steps=uncertainty_last_steps,
+        enable_trajectory_refinement=enable_trajectory_refinement,
+        trajectory_refinement_remaining_steps=trajectory_refinement_remaining_steps,
+        trajectory_refinement_corruption_frames=trajectory_refinement_corruption_frames,
+        trajectory_refinement_restoration_frames=trajectory_refinement_restoration_frames,
+        trajectory_refinement_gamma=trajectory_refinement_gamma,
+        trajectory_refinement_strength=trajectory_refinement_strength,
     )
 
 
@@ -824,6 +930,14 @@ def generate_singleturn_sample_from_latents(
     weight_dtype: Optional[torch.dtype] = None,
     max_sequence_length: int = 512,
     total_frames: int = SINGLETURN_TOTAL_FRAMES,
+    enable_uncertainty_viz: bool = False,
+    uncertainty_last_steps: int = 10,
+    enable_trajectory_refinement: bool = False,
+    trajectory_refinement_remaining_steps: int = 10,
+    trajectory_refinement_corruption_frames: int = SINGLETURN_DEFAULT_CACHE_CORRUPTION_FRAMES,
+    trajectory_refinement_restoration_frames: int = SINGLETURN_DEFAULT_CACHE_RESTORATION_FRAMES,
+    trajectory_refinement_gamma: float = 2.0,
+    trajectory_refinement_strength: float = 1.0,
 ):
     device = pipeline._execution_device
     weight_dtype = weight_dtype or getattr(pipeline.transformer, "dtype", torch.float32)
@@ -848,6 +962,14 @@ def generate_singleturn_sample_from_latents(
         generator=generator,
         weight_dtype=weight_dtype,
         total_frames=total_frames,
+        enable_uncertainty_viz=enable_uncertainty_viz,
+        uncertainty_last_steps=uncertainty_last_steps,
+        enable_trajectory_refinement=enable_trajectory_refinement,
+        trajectory_refinement_remaining_steps=trajectory_refinement_remaining_steps,
+        trajectory_refinement_corruption_frames=trajectory_refinement_corruption_frames,
+        trajectory_refinement_restoration_frames=trajectory_refinement_restoration_frames,
+        trajectory_refinement_gamma=trajectory_refinement_gamma,
+        trajectory_refinement_strength=trajectory_refinement_strength,
     )
 
 
@@ -976,4 +1098,83 @@ def save_singleturn_outputs(
         "tail_last_frame": tail_last,
         "full_last_frame_pure": full_last_pure,
         "tail_last_frame_pure": tail_last_pure,
+    }
+
+
+def save_singleturn_uncertainty_visuals(
+    uncertainty_map: torch.Tensor,
+    frames: torch.Tensor,
+    output_dir: str,
+    stem: str = "singleturn",
+) -> Dict[str, str]:
+    os.makedirs(output_dir, exist_ok=True)
+    uncertainty_map = uncertainty_map.detach().cpu().float()
+    if uncertainty_map.ndim == 2:
+        uncertainty_maps = uncertainty_map.unsqueeze(0)
+    elif uncertainty_map.ndim == 3:
+        uncertainty_maps = uncertainty_map
+    else:
+        raise ValueError(f"uncertainty_map must have shape (H, W) or (T, H, W), got {tuple(uncertainty_map.shape)}")
+
+    frames = frames.detach().cpu().float()
+    if frames.ndim == 3:
+        frames = frames.unsqueeze(1)
+    if frames.ndim != 4:
+        raise ValueError(f"frames must have shape (C, H, W) or (C, T, H, W), got {tuple(frames.shape)}")
+    if frames.shape[0] == 1:
+        frames = frames.repeat(3, 1, 1, 1)
+    if frames.shape[1] != uncertainty_maps.shape[0]:
+        raise ValueError(
+            "frames and uncertainty_map must have the same frame count, "
+            f"got {frames.shape[1]} and {uncertainty_maps.shape[0]}."
+        )
+
+    npy_path = os.path.join(output_dir, f"{stem}_uncertainty.npy")
+    np.save(npy_path, uncertainty_map.numpy())
+
+    min_value = uncertainty_maps.min()
+    max_value = uncertainty_maps.max()
+    denom = (max_value - min_value).clamp_min(1e-8)
+    normalized = ((uncertainty_maps - min_value) / denom).clamp(0, 1)
+    image_height, image_width = int(frames.shape[-2]), int(frames.shape[-1])
+    resized = F.interpolate(
+        normalized[:, None],
+        size=(image_height, image_width),
+        mode="bilinear",
+        align_corners=False,
+    )[:, 0].clamp(0, 1)
+
+    heatmap_paths = []
+    overlay_paths = []
+    for frame_idx in range(resized.shape[0]):
+        heatmap_path = os.path.join(output_dir, f"{stem}_uncertainty_frame{frame_idx:02d}_heatmap.png")
+        overlay_path = os.path.join(output_dir, f"{stem}_uncertainty_frame{frame_idx:02d}_overlay.png")
+        heat = resized[frame_idx].numpy()
+        heatmap = np.zeros((image_height, image_width, 3), dtype=np.uint8)
+        heatmap[..., 0] = (heat * 255).astype(np.uint8)
+        Image.fromarray(heatmap).save(heatmap_path)
+
+        frame = frames[:3, frame_idx]
+        base = (frame.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
+        red = np.zeros_like(base)
+        red[..., 0] = 255
+        alpha = (0.45 * heat)[..., None]
+        overlay = (base.astype(np.float32) * (1.0 - alpha) + red.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
+        Image.fromarray(overlay).save(overlay_path)
+        heatmap_paths.append(heatmap_path)
+        overlay_paths.append(overlay_path)
+
+    heatmap_path = os.path.join(output_dir, f"{stem}_uncertainty_heatmap.png")
+    overlay_path = os.path.join(output_dir, f"{stem}_uncertainty_overlay.png")
+    with Image.open(heatmap_paths[-1]) as image:
+        image.save(heatmap_path)
+    with Image.open(overlay_paths[-1]) as image:
+        image.save(overlay_path)
+
+    return {
+        "uncertainty_heatmap": heatmap_path,
+        "uncertainty_overlay": overlay_path,
+        "uncertainty_npy": npy_path,
+        "uncertainty_frame_heatmaps": heatmap_paths,
+        "uncertainty_frame_overlays": overlay_paths,
     }
