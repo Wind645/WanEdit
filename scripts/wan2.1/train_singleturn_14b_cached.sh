@@ -2,10 +2,11 @@
 set -euo pipefail
 
 export MODEL_NAME=${MODEL_NAME:-/mnt/cpfs/jiachengliu/pretrained_models/Wan-AI/Wan2.1-T2V-14B}
-export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1}
+# export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1}
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/ObjectClear_CORNE_60k_scribble_v1/cache/singleturn_objectclear_corne_60k_scribble_wan2.1_1.3b_keyframe_cache_v1}
 export CACHED_DATA_META=${CACHED_DATA_META:-${CACHED_DATA_DIR}/manifest.json}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}
-export OUTPUT_DIR=${OUTPUT_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_maskpred}
+export OUTPUT_DIR=${OUTPUT_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_scribblemask}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export WANDB_MODE=${WANDB_MODE:-online}
@@ -18,6 +19,7 @@ export LORA_INIT_PATH=${LORA_INIT_PATH:-}
 export SINGLETURN_VALIDATION_IMAGE_PATH=${SINGLETURN_VALIDATION_IMAGE_PATH:-}
 export SINGLETURN_VALIDATION_MASK_PATH=${SINGLETURN_VALIDATION_MASK_PATH:-}
 export SINGLETURN_VALIDATION_NEGATIVE_PROMPT=${SINGLETURN_VALIDATION_NEGATIVE_PROMPT:-}
+export SHARED_PROMPT_CACHE=${SHARED_PROMPT_CACHE:-/mnt/cpfs/jiachengliu/code/object_removal/VideoCoF/WanEdit/t5_prompt_parts.pt}
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-7}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-1}

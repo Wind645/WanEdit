@@ -564,7 +564,7 @@ class CachedSingleTurnLatentDataset(Dataset):
         prompt_text = payload.get("text", CORNE_SINGLETURN_PROMPT)
         formatted_text = payload.get("formatted_text", prompt_text)
         text_split_point = None
-        shared_prompt_cache = payload.get("shared_prompt_cache")
+        shared_prompt_cache = os.environ.get("SHARED_PROMPT_CACHE") or payload.get("shared_prompt_cache")
         if shared_prompt_cache is not None:
             shared_payload = self._load_shared_prompt_cache(shared_prompt_cache)
             prompt_embeds = shared_payload["prompt_embeds"]

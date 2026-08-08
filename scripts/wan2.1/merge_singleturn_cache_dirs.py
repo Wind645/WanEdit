@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 
-SUPPORTED_DATASET_TYPES = {"corne_object_removal", "objectclear_object_removal"}
+SUPPORTED_DATASET_TYPES = {"corne_object_removal", "objectclear_object_removal", "flat_object_removal"}
 
 
 def parse_args():
