@@ -34,6 +34,7 @@ from videox_fun.pipeline import WanPipeline
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (
     CORNE_SINGLETURN_PROMPT,
+    SINGLETURN_ENDPOINT_TOTAL_FRAMES,
     SINGLETURN_MASK_PREDICTION_FRAME_INDEX,
     SINGLETURN_TAIL_START,
     SINGLETURN_TOTAL_FRAMES,
@@ -105,13 +106,17 @@ def _load_shared_prompt_cache(shared_prompt_cache: str):
         prompt_embeds = torch.cat([part1_embed, part2_embed], dim=0)
         prompt_seq_len = prompt_embeds.shape[0]
         text_split_point = int(part1["seq_len"]) if "seq_len" in part1 else part1_embed.shape[0]
-        return {
+        result = {
             "prompt_embeds": prompt_embeds,
             "prompt_seq_len": prompt_seq_len,
             "text_split_point": text_split_point,
             "text": payload.get("text", CORNE_SINGLETURN_PROMPT),
             "formatted_text": payload.get("formatted_text", payload.get("text", CORNE_SINGLETURN_PROMPT)),
         }
+        if "original" in payload:
+            result["original_prompt_embeds"] = payload["original"]["embedding"]
+            result["original_prompt_seq_len"] = int(payload["original"]["seq_len"])
+        return result
     missing = [key for key in ("prompt_embeds", "prompt_seq_len") if key not in payload]
     if missing:
         raise ValueError(f"Shared prompt cache {shared_prompt_cache} is missing keys: {missing}")
@@ -509,19 +514,19 @@ def _save_singleturn_input_visuals(
 
 
 def _resolve_raw_image_dir(raw_data_dir: str) -> str:
-    for dirname in ("img", "images"):
+    for dirname in ("img", "images", "input"):
         path = os.path.join(raw_data_dir, dirname)
         if os.path.isdir(path):
             return path
-    raise FileNotFoundError(f"Missing raw image folder: expected img/ or images/ under {raw_data_dir}")
+    raise FileNotFoundError(f"Missing raw image folder: expected img/ or images/ or input/ under {raw_data_dir}")
 
 
 def _resolve_raw_mask_dir(raw_data_dir: str) -> str:
-    for dirname in ("mask", "masks"):
+    for dirname in ("mask", "masks", "condition_mask"):
         path = os.path.join(raw_data_dir, dirname)
         if os.path.isdir(path):
             return path
-    raise FileNotFoundError(f"Missing raw mask folder: expected mask/ or masks/ under {raw_data_dir}")
+    raise FileNotFoundError(f"Missing raw mask folder: expected mask/ or masks/ or condition_mask/ under {raw_data_dir}")
 
 
 def _find_raw_file(root: str, rel_stem: str, suffixes: tuple[str, ...]) -> Optional[str]:
@@ -900,25 +905,46 @@ def _run_singleturn_cached_sample(
 
     with torch.no_grad():
         total_frames = int(sample.get("total_frames", SINGLETURN_TOTAL_FRAMES))
+        if args.singleturn_endpoint_mode:
+            total_frames = SINGLETURN_ENDPOINT_TOTAL_FRAMES
 
         # Compute split points for decoupled cross-attention
         text_split_point = prompt_cache.get("text_split_point")
         latent_split_point = None
-        if text_split_point is not None:
-            patch_size = pipeline.transformer.config.patch_size
-            # source_frame_latent shape: (B, C, 1, H_latent, W_latent)
-            _h_latent = sample["source_frame_latent"].shape[-2]
-            _w_latent = sample["source_frame_latent"].shape[-1]
-            tokens_per_frame = (_h_latent // patch_size[1]) * (_w_latent // patch_size[2])
-            noisy_anchor_frame_index = SINGLETURN_TAIL_START + args.singleturn_cache_corruption_frames
-            latent_split_point = (noisy_anchor_frame_index + 1) * tokens_per_frame
+
+        if args.rollback_cross_attn:
+            text_split_point = None
+            use_prompt_embeds = prompt_cache.get("original_prompt_embeds", prompt_cache["prompt_embeds"])
+            use_prompt_seq_len = prompt_cache.get("original_prompt_seq_len", prompt_cache["prompt_seq_len"])
+        else:
+            use_prompt_embeds = prompt_cache["prompt_embeds"]
+            use_prompt_seq_len = prompt_cache["prompt_seq_len"]
+            if text_split_point is not None:
+                patch_size = pipeline.transformer.config.patch_size
+                _h_latent = sample["source_frame_latent"].shape[-2]
+                _w_latent = sample["source_frame_latent"].shape[-1]
+                tokens_per_frame = (_h_latent // patch_size[1]) * (_w_latent // patch_size[2])
+                if args.singleturn_endpoint_mode:
+                    latent_split_point = SINGLETURN_TAIL_START * tokens_per_frame
+                else:
+                    noisy_anchor_frame_index = SINGLETURN_TAIL_START + args.singleturn_cache_corruption_frames
+                    latent_split_point = (noisy_anchor_frame_index + 1) * tokens_per_frame
+
+        # RoPE temporal index: [0, 1, 1, 2, 3, ..., f-2] — unless rolled back
+        if args.rollback_rope:
+            temporal_index_map = None
+        else:
+            t_indices = list(range(total_frames - 1))
+            t_indices.insert(1, 1)
+            batch_size = 2 if args.guidance_scale > 1.0 else 1
+            temporal_index_map = [t_indices] * batch_size
 
         coarse_generation = generate_singleturn_sample_from_latents(
             pipeline=pipeline,
             mask_frame_latent=sample["mask_frame_latent"],
             source_frame_latent=sample["source_frame_latent"],
-            prompt_embeds=prompt_cache["prompt_embeds"],
-            prompt_seq_len=prompt_cache["prompt_seq_len"],
+            prompt_embeds=use_prompt_embeds,
+            prompt_seq_len=use_prompt_seq_len,
             negative_prompt=args.negative_prompt,
             guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps,
@@ -935,6 +961,7 @@ def _run_singleturn_cached_sample(
             trajectory_refinement_strength=args.trajectory_refinement_strength,
             latent_split_point=latent_split_point,
             text_split_point=text_split_point,
+            temporal_index_map=temporal_index_map,
         )
         refined_generation = None
         if args.enable_refinement:
@@ -1254,6 +1281,21 @@ def parse_args():
         help="Total latent frames used in direct image-mode SingleTurn inference. Defaults to corruption/restoration layout size.",
     )
     parser.add_argument(
+        "--singleturn_endpoint_mode",
+        action="store_true",
+        help="Endpoint mode: skip interpolation frames, use [mask, pred, source, target] 4-frame layout.",
+    )
+    parser.add_argument(
+        "--rollback_cross_attn",
+        action="store_true",
+        help="Disable decoupled cross-attention; use unified prompt for all frames (RoPE trick remains).",
+    )
+    parser.add_argument(
+        "--rollback_rope",
+        action="store_true",
+        help="Disable RoPE temporal trick; use standard [0,1,2,...] indices instead of shared positions.",
+    )
+    parser.add_argument(
         "--singleturn_cache_corruption_frames",
         type=int,
         default=2,
@@ -1372,18 +1414,21 @@ def parse_args():
         raise ValueError("--refinement_lora_path requires --enable_refinement.")
     if args.singleturn_cache_corruption_frames < 0 or args.singleturn_cache_restoration_frames < 0:
         raise ValueError("--singleturn_cache_corruption_frames and --singleturn_cache_restoration_frames must be non-negative.")
-    expected_singleturn_total_frames = compute_singleturn_object_removal_total_frames(
-        args.singleturn_cache_corruption_frames,
-        args.singleturn_cache_restoration_frames,
-    )
-    if args.singleturn_total_frames is None:
-        args.singleturn_total_frames = expected_singleturn_total_frames
-    elif args.singleturn_total_frames != expected_singleturn_total_frames:
-        raise ValueError(
-            "--singleturn_total_frames must match --singleturn_cache_corruption_frames/"
-            "--singleturn_cache_restoration_frames layout, "
-            f"got {args.singleturn_total_frames} vs expected {expected_singleturn_total_frames}."
+    if args.singleturn_endpoint_mode:
+        args.singleturn_total_frames = SINGLETURN_ENDPOINT_TOTAL_FRAMES
+    else:
+        expected_singleturn_total_frames = compute_singleturn_object_removal_total_frames(
+            args.singleturn_cache_corruption_frames,
+            args.singleturn_cache_restoration_frames,
         )
+        if args.singleturn_total_frames is None:
+            args.singleturn_total_frames = expected_singleturn_total_frames
+        elif args.singleturn_total_frames != expected_singleturn_total_frames:
+            raise ValueError(
+                "--singleturn_total_frames must match --singleturn_cache_corruption_frames/"
+                "--singleturn_cache_restoration_frames layout, "
+                f"got {args.singleturn_total_frames} vs expected {expected_singleturn_total_frames}."
+            )
     if args.singleturn_cache_interpolation_gamma <= 0:
         raise ValueError("--singleturn_cache_interpolation_gamma must be positive.")
     if args.uncertainty_last_steps <= 0:

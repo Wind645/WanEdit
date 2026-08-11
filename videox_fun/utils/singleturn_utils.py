@@ -24,6 +24,7 @@ SINGLETURN_CONDITION_FRAME_INDICES = (
 SINGLETURN_FIRST_FRAME_FIXED_PREFIX_FRAMES = 1
 SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES = 5
 SINGLETURN_TAIL_START = SINGLETURN_SOURCE_CONDITION_FRAME_INDEX + 1
+SINGLETURN_ENDPOINT_TOTAL_FRAMES = SINGLETURN_TAIL_START + 1  # = 4
 
 
 def compute_singleturn_object_removal_total_frames(corruption_frames: int, restoration_frames: int) -> int:
@@ -434,6 +435,19 @@ def build_singleturn_edge_weight_map(
     return edge_weight_map.to(dtype=mask_check_latent.dtype)
 
 
+def build_singleturn_endpoint_latents(
+    mask_frame_latent: torch.Tensor,
+    source_frame_latent: torch.Tensor,
+    bg_latent: torch.Tensor,
+) -> torch.Tensor:
+    _ensure_singleturn_latent_shape("mask_frame_latent", mask_frame_latent)
+    _ensure_singleturn_latent_shape("source_frame_latent", source_frame_latent)
+    _ensure_singleturn_latent_shape("bg_latent", bg_latent)
+    _ensure_matching_shapes(source_frame_latent, mask_frame_latent, "mask_frame_latent")
+    _ensure_matching_shapes(source_frame_latent, bg_latent, "bg_latent")
+    return torch.cat([mask_frame_latent, mask_frame_latent, source_frame_latent, bg_latent], dim=2)
+
+
 def build_singleturn_prefix_inference_latents(
     mask_frame_latent: torch.Tensor,
     middle_frame_latent: torch.Tensor,
@@ -720,6 +734,7 @@ def _run_singleturn_generation(
     trajectory_refinement_strength: float = 1.0,
     latent_split_point: Optional[int] = None,
     text_split_point: Optional[int] = None,
+    temporal_index_map=None,
 ):
     device = pipeline._execution_device
     do_classifier_free_guidance = guidance_scale > 1.0
@@ -826,6 +841,7 @@ def _run_singleturn_generation(
                 seq_len=seq_len,
                 latent_split_point=latent_split_point,
                 text_split_point=text_split_point,
+                temporal_index_map=temporal_index_map,
             )
 
         if do_classifier_free_guidance:
@@ -887,6 +903,7 @@ def generate_singleturn_sample(
     trajectory_refinement_strength: float = 1.0,
     latent_split_point: Optional[int] = None,
     text_split_point: Optional[int] = None,
+    temporal_index_map=None,
 ):
     del prompt
     del prompt_template
@@ -922,6 +939,7 @@ def generate_singleturn_sample(
         trajectory_refinement_strength=trajectory_refinement_strength,
         latent_split_point=latent_split_point,
         text_split_point=text_split_point,
+        temporal_index_map=temporal_index_map,
     )
 
 
@@ -948,6 +966,7 @@ def generate_singleturn_sample_from_latents(
     trajectory_refinement_strength: float = 1.0,
     latent_split_point: Optional[int] = None,
     text_split_point: Optional[int] = None,
+    temporal_index_map=None,
 ):
     device = pipeline._execution_device
     weight_dtype = weight_dtype or getattr(pipeline.transformer, "dtype", torch.float32)
@@ -982,6 +1001,7 @@ def generate_singleturn_sample_from_latents(
         trajectory_refinement_strength=trajectory_refinement_strength,
         latent_split_point=latent_split_point,
         text_split_point=text_split_point,
+        temporal_index_map=temporal_index_map,
     )
 
 

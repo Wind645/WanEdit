@@ -6,7 +6,7 @@ export MODEL_NAME=${MODEL_NAME:-/mnt/cpfs/jiachengliu/pretrained_models/Wan-AI/W
 export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/ObjectClear_CORNE_60k_scribble_v1/cache/singleturn_objectclear_corne_60k_scribble_wan2.1_1.3b_keyframe_cache_v1}
 export CACHED_DATA_META=${CACHED_DATA_META:-${CACHED_DATA_DIR}/manifest.json}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}
-export OUTPUT_DIR=${OUTPUT_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_scribblemask}
+export OUTPUT_DIR=${OUTPUT_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_nocrossattn}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export WANDB_MODE=${WANDB_MODE:-online}
@@ -35,6 +35,9 @@ SINGLETURN_CACHE_CORRUPTION_FRAMES=${SINGLETURN_CACHE_CORRUPTION_FRAMES:-4}
 SINGLETURN_CACHE_RESTORATION_FRAMES=${SINGLETURN_CACHE_RESTORATION_FRAMES:-5}
 SINGLETURN_CACHE_INTERPOLATION_GAMMA=${SINGLETURN_CACHE_INTERPOLATION_GAMMA:-1.2}
 SINGLETURN_TRAIN_MASK_SAM_ONLY=${SINGLETURN_TRAIN_MASK_SAM_ONLY:-0}
+SINGLETURN_ENDPOINT_MODE=${SINGLETURN_ENDPOINT_MODE:-0}
+ROLLBACK_CROSS_ATTN=${ROLLBACK_CROSS_ATTN:-1}
+ROLLBACK_ROPE=${ROLLBACK_ROPE:-0}
 SINGLETURN_VALIDATION_GUIDANCE_SCALE=${SINGLETURN_VALIDATION_GUIDANCE_SCALE:-5.0}
 SINGLETURN_VALIDATION_NUM_INFERENCE_STEPS=${SINGLETURN_VALIDATION_NUM_INFERENCE_STEPS:-50}
 SINGLETURN_VALIDATION_FPS=${SINGLETURN_VALIDATION_FPS:-4}
@@ -139,6 +142,24 @@ fi
 if [[ "${SINGLETURN_TRAIN_MASK_SAM_ONLY}" == "1" ]]; then
   cmd+=(
     --singleturn_train_mask_sam_only
+  )
+fi
+
+if [[ "${SINGLETURN_ENDPOINT_MODE}" == "1" ]]; then
+  cmd+=(
+    --singleturn_endpoint_mode
+  )
+fi
+
+if [[ "${ROLLBACK_CROSS_ATTN}" == "1" ]]; then
+  cmd+=(
+    --rollback_cross_attn
+  )
+fi
+
+if [[ "${ROLLBACK_ROPE}" == "1" ]]; then
+  cmd+=(
+    --rollback_rope
   )
 fi
 

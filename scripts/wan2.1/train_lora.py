@@ -97,6 +97,7 @@ except ImportError:
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import create_network, merge_lora, unmerge_lora
 from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
+                                               build_singleturn_endpoint_latents,
                                                build_singleturn_object_removal_latents,
                                                build_singleturn_loss_mask_like,
                                                compute_singleturn_object_removal_total_frames,
@@ -107,6 +108,7 @@ from videox_fun.utils.singleturn_utils import (CORNE_SINGLETURN_PROMPT,
                                                preprocess_singleturn_image,
                                                preprocess_singleturn_mask_frame,
                                                resize_singleturn_mask_to_latent_grid,
+                                               SINGLETURN_ENDPOINT_TOTAL_FRAMES,
                                                SINGLETURN_REFINEMENT_FIXED_PREFIX_FRAMES,
                                                SINGLETURN_SOURCE_CONDITION_FRAME_INDEX,
                                                SINGLETURN_TAIL_START,
@@ -998,6 +1000,21 @@ def parse_args():
         help="Enable SingleTurn image-edit training with a dedicated image-pair dataset and 7-frame latent recipe.",
     )
     parser.add_argument(
+        "--singleturn_endpoint_mode",
+        action="store_true",
+        help="Endpoint mode: skip interpolation frames, use [mask, pred, source, target] 4-frame layout.",
+    )
+    parser.add_argument(
+        "--rollback_cross_attn",
+        action="store_true",
+        help="Disable decoupled cross-attention; use unified prompt for all frames (RoPE trick remains).",
+    )
+    parser.add_argument(
+        "--rollback_rope",
+        action="store_true",
+        help="Disable RoPE temporal trick; use standard [0,1,2,...] indices instead of shared positions.",
+    )
+    parser.add_argument(
         "--singleturn_refine_mode",
         action="store_true",
         help="Enable cached SingleTurn refinement training on coarse latent trajectories with a one-step tail correction target.",
@@ -1436,6 +1453,24 @@ def main():
         args.mixed_precision = accelerator.mixed_precision
 
     singleturn_shared_prompt_cache = None
+    rollback_unified_prompt_embeds = None
+    if args.rollback_cross_attn and args.singleturn_mode:
+        _prompt_cache_path = os.environ.get("SHARED_PROMPT_CACHE", "")
+        if _prompt_cache_path and os.path.isfile(_prompt_cache_path):
+            try:
+                _payload = torch.load(_prompt_cache_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                _payload = torch.load(_prompt_cache_path, map_location="cpu")
+            if "original" in _payload:
+                rollback_unified_prompt_embeds = _payload["original"]["embedding"].to(dtype=weight_dtype)
+            else:
+                raise ValueError(
+                    f"--rollback_cross_attn requires 'original' key in SHARED_PROMPT_CACHE={_prompt_cache_path}"
+                )
+        else:
+            raise ValueError(
+                "--rollback_cross_attn requires SHARED_PROMPT_CACHE env var pointing to a valid .pt file"
+            )
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = FlowMatchEulerDiscreteScheduler(
@@ -2222,6 +2257,16 @@ def main():
                                 device=accelerator.device,
                                 refinement_mode=args.singleturn_refine_mode,
                             )
+                            if args.singleturn_endpoint_mode:
+                                latents = torch.cat([
+                                    latents[:, :, :SINGLETURN_TAIL_START],
+                                    latents[:, :, -1:],
+                                ], dim=2)
+                            if args.rollback_cross_attn:
+                                text_split_point = None
+                                prompt_embeds = [
+                                    rollback_unified_prompt_embeds.to(device=accelerator.device)
+                                ] * latents.shape[0]
                         else:
                             latents, prompt_embeds = load_cached_batch(
                                 batch=batch,
@@ -2384,27 +2429,34 @@ def main():
                             mask_frame_latents = _batch_encode_vae(mask_frame_pixel_values, use_mode=True)
                             source_latents = _batch_encode_vae(src_pixel_values, use_mode=True)
                             target_latents = _batch_encode_vae(tgt_pixel_values, use_mode=True)
-                            latent_mask = resize_singleturn_mask_to_latent_grid(mask_check_pixel_values, source_latents)
-                            noise_latents = torch.randn(
-                                source_latents.size(),
-                                device=source_latents.device,
-                                generator=torch_rng,
-                                dtype=weight_dtype,
-                            )
-                            latents = build_singleturn_object_removal_latents(
-                                mask_frame_latent=mask_frame_latents,
-                                source_frame_latent=source_latents,
-                                bg_latent=target_latents,
-                                mask_check_latent=latent_mask,
-                                noise_latent=noise_latents,
-                                total_frames=compute_singleturn_object_removal_total_frames(
-                                    args.singleturn_cache_corruption_frames,
-                                    args.singleturn_cache_restoration_frames,
-                                ),
-                                corruption_frames=args.singleturn_cache_corruption_frames,
-                                restoration_frames=args.singleturn_cache_restoration_frames,
-                                interpolation_gamma=args.singleturn_cache_interpolation_gamma,
-                            )
+                            if args.singleturn_endpoint_mode:
+                                latents = build_singleturn_endpoint_latents(
+                                    mask_frame_latent=mask_frame_latents,
+                                    source_frame_latent=source_latents,
+                                    bg_latent=target_latents,
+                                )
+                            else:
+                                latent_mask = resize_singleturn_mask_to_latent_grid(mask_check_pixel_values, source_latents)
+                                noise_latents = torch.randn(
+                                    source_latents.size(),
+                                    device=source_latents.device,
+                                    generator=torch_rng,
+                                    dtype=weight_dtype,
+                                )
+                                latents = build_singleturn_object_removal_latents(
+                                    mask_frame_latent=mask_frame_latents,
+                                    source_frame_latent=source_latents,
+                                    bg_latent=target_latents,
+                                    mask_check_latent=latent_mask,
+                                    noise_latent=noise_latents,
+                                    total_frames=compute_singleturn_object_removal_total_frames(
+                                        args.singleturn_cache_corruption_frames,
+                                        args.singleturn_cache_restoration_frames,
+                                    ),
+                                    corruption_frames=args.singleturn_cache_corruption_frames,
+                                    restoration_frames=args.singleturn_cache_restoration_frames,
+                                    interpolation_gamma=args.singleturn_cache_interpolation_gamma,
+                                )
                         elif vae_stream_1 is not None:
                             vae_stream_1.wait_stream(torch.cuda.current_stream())
                             with torch.cuda.stream(vae_stream_1):
@@ -2533,14 +2585,19 @@ def main():
                 else:
                     sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                     if args.singleturn_mode:
-                        expected_singleturn_total_frames = compute_singleturn_object_removal_total_frames(
-                            args.singleturn_cache_corruption_frames,
-                            args.singleturn_cache_restoration_frames,
-                        )
+                        if args.singleturn_endpoint_mode:
+                            expected_singleturn_total_frames = SINGLETURN_ENDPOINT_TOTAL_FRAMES
+                        else:
+                            expected_singleturn_total_frames = compute_singleturn_object_removal_total_frames(
+                                args.singleturn_cache_corruption_frames,
+                                args.singleturn_cache_restoration_frames,
+                            )
                         use_dynamic_singleturn_tail_start = False
                         singleturn_source_condition_frame = None
                         if latents.shape[2] == expected_singleturn_total_frames:
-                            if use_cached_data:
+                            if args.singleturn_endpoint_mode:
+                                use_dynamic_singleturn_tail_start = True
+                            elif use_cached_data:
                                 batch_total_frames = batch.get("total_frames")
                                 if isinstance(batch_total_frames, torch.Tensor):
                                     total_frames_match = bool(
@@ -2625,12 +2682,25 @@ def main():
                     accelerator.unwrap_model(transformer3d).config.patch_size,
                 )
                 # Compute latent_split_point for decoupled cross-attention
-                if text_split_point is not None and args.singleturn_mode:
+                temporal_index_map = None
+                if args.singleturn_mode:
                     _patch_size = accelerator.unwrap_model(transformer3d).config.patch_size
                     _, _, _num_frames, _h_latent, _w_latent = latents.shape
                     _tokens_per_frame = (_h_latent // _patch_size[1]) * (_w_latent // _patch_size[2])
-                    _noisy_anchor_frame_index = SINGLETURN_TAIL_START + args.singleturn_cache_corruption_frames
-                    latent_split_point = (_noisy_anchor_frame_index + 1) * _tokens_per_frame
+                    # RoPE temporal index — always active unless rolled back
+                    if args.rollback_rope:
+                        temporal_index_map = None
+                    else:
+                        t_indices = list(range(_num_frames - 1))
+                        t_indices.insert(1, 1)
+                        temporal_index_map = [t_indices] * noisy_latents.shape[0]
+                    # Decoupled cross-attention split — only when not rolled back
+                    if text_split_point is not None:
+                        if args.singleturn_endpoint_mode:
+                            latent_split_point = SINGLETURN_TAIL_START * _tokens_per_frame
+                        else:
+                            _noisy_anchor_frame_index = SINGLETURN_TAIL_START + args.singleturn_cache_corruption_frames
+                            latent_split_point = (_noisy_anchor_frame_index + 1) * _tokens_per_frame
                 # Predict the noise residual
                 with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
                     noise_pred = transformer3d(
@@ -2642,6 +2712,7 @@ def main():
                         clip_fea=clip_context if args.train_mode != "normal" else None,
                         latent_split_point=latent_split_point,
                         text_split_point=text_split_point,
+                        temporal_index_map=temporal_index_map,
                     )
                 
                 def custom_mse_loss(noise_pred, target, weighting=None, threshold=50, loss_mask=None):

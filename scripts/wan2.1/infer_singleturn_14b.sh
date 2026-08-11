@@ -9,15 +9,16 @@ export CACHED_SAMPLE_PATH=${CACHED_SAMPLE_PATH:-}
 export RAW_DATA_DIR=${RAW_DATA_DIR:-}
 export RAW_SELECTED_TRIPLETS=${RAW_SELECTED_TRIPLETS:-}
 export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/ObjectClear_CORNE_60k_scribble_v1/cache/singleturn_objectclear_corne_60k_scribble_wan2.1_1.3b_keyframe_cache_v1}
+# export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1}
 export CACHED_DATA_META=${CACHED_DATA_META:-${CACHED_DATA_DIR}/manifest.json}
 export SHARED_PROMPT_CACHE=${SHARED_PROMPT_CACHE:-/mnt/cpfs/jiachengliu/code/object_removal/VideoCoF/WanEdit/t5_prompt_parts.pt}
 export CACHED_START_INDEX=${CACHED_START_INDEX:-0}
 export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-}
 export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/14b_scribble_mask}
-export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_scribblemask/checkpoint-800/lora_diffusion_pytorch_model.safetensors}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-7}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/14b_validate}
+export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/14B_nocrossattn/checkpoint-1900/lora_diffusion_pytorch_model.safetensors}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
 export ENABLE_MASK_BLENDING=${ENABLE_MASK_BLENDING:-1}
 export MASK_BLEND_THRESHOLD=${MASK_BLEND_THRESHOLD:-0.5}
@@ -34,7 +35,7 @@ export REFINEMENT_LORA_PATH=${REFINEMENT_LORA_PATH:-}
 export REFINEMENT_LORA_ALPHA=${REFINEMENT_LORA_ALPHA:-1.0}
 export REFINEMENT_GUIDANCE_SCALE=${REFINEMENT_GUIDANCE_SCALE:-1.0}
 
-NPROC_PER_NODE=${NPROC_PER_NODE:-0}
+NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-50}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-5.0}
 SAMPLE_HEIGHT=${SAMPLE_HEIGHT:-${SAMPLE_SIZE:-480}}
@@ -43,6 +44,9 @@ SINGLETURN_CACHE_CORRUPTION_FRAMES=${SINGLETURN_CACHE_CORRUPTION_FRAMES:-4}
 SINGLETURN_CACHE_RESTORATION_FRAMES=${SINGLETURN_CACHE_RESTORATION_FRAMES:-5}
 SINGLETURN_CACHE_INTERPOLATION_GAMMA=${SINGLETURN_CACHE_INTERPOLATION_GAMMA:-1.2}
 SINGLETURN_MASK_CONDITION_SOURCE=${SINGLETURN_MASK_CONDITION_SOURCE:-mask_sam}
+SINGLETURN_ENDPOINT_MODE=${SINGLETURN_ENDPOINT_MODE:-0}
+ROLLBACK_CROSS_ATTN=${ROLLBACK_CROSS_ATTN:-1}
+ROLLBACK_ROPE=${ROLLBACK_ROPE:-0}
 SEED=${SEED:-0}
 FPS=${FPS:-4}
 DTYPE=${DTYPE:-bf16}
@@ -105,6 +109,24 @@ fi
 if [[ -n "${TRAJECTORY_REFINEMENT_GAMMA}" ]]; then
   cmd_base+=(
     --trajectory_refinement_gamma "$TRAJECTORY_REFINEMENT_GAMMA"
+  )
+fi
+
+if [[ "${SINGLETURN_ENDPOINT_MODE}" == "1" ]]; then
+  cmd_base+=(
+    --singleturn_endpoint_mode
+  )
+fi
+
+if [[ "${ROLLBACK_CROSS_ATTN}" == "1" ]]; then
+  cmd_base+=(
+    --rollback_cross_attn
+  )
+fi
+
+if [[ "${ROLLBACK_ROPE}" == "1" ]]; then
+  cmd_base+=(
+    --rollback_rope
   )
 fi
 

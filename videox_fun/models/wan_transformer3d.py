@@ -134,7 +134,7 @@ def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
 
 @amp.autocast(enabled=False)
 @torch.compiler.disable()
-def rope_apply(x, grid_sizes, freqs, frame_split_indices=None, ground_frame_indices=None):
+def rope_apply(x, grid_sizes, freqs, frame_split_indices=None, ground_frame_indices=None, temporal_index_map=None):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -187,8 +187,12 @@ def rope_apply(x, grid_sizes, freqs, frame_split_indices=None, ground_frame_indi
                 freqs_tgt_t = freqs[0][:f_tgt].view(f_tgt, 1, 1, -1).expand(f_tgt, h, w, -1)
                 freqs_temporal = torch.cat([freqs_src_t, freqs_tgt_t], dim=0)
         else:
-            # Default: continuous temporal positions [0, f-1]
-            freqs_temporal = freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1)
+            # Default: continuous temporal positions [0, f-1] or custom map
+            if temporal_index_map is not None and i < len(temporal_index_map):
+                t_indices = temporal_index_map[i]
+                freqs_temporal = freqs[0][t_indices].view(f, 1, 1, -1).expand(f, h, w, -1)
+            else:
+                freqs_temporal = freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1)
         
         # Combine temporal + spatial freqs
         freqs_i = torch.cat([
@@ -205,9 +209,9 @@ def rope_apply(x, grid_sizes, freqs, frame_split_indices=None, ground_frame_indi
     return torch.stack(output).to(x.dtype)
 
 
-def rope_apply_qk(q, k, grid_sizes, freqs, frame_split_indices=None, ground_frame_indices=None):
-    q = rope_apply(q, grid_sizes, freqs, frame_split_indices, ground_frame_indices)
-    k = rope_apply(k, grid_sizes, freqs, frame_split_indices, ground_frame_indices)
+def rope_apply_qk(q, k, grid_sizes, freqs, frame_split_indices=None, ground_frame_indices=None, temporal_index_map=None):
+    q = rope_apply(q, grid_sizes, freqs, frame_split_indices, ground_frame_indices, temporal_index_map)
+    k = rope_apply(k, grid_sizes, freqs, frame_split_indices, ground_frame_indices, temporal_index_map)
     return q, k
 
 
@@ -268,7 +272,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16, t=0, frame_split_indices=None, ground_frame_indices=None):
+    def forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16, t=0, frame_split_indices=None, ground_frame_indices=None, temporal_index_map=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -277,6 +281,7 @@ class WanSelfAttention(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             frame_split_indices(List[int], optional): Split indices for paired data temporal RoPE
             ground_frame_indices(List[Tuple[int, int]], optional): Ground frame positions for special temporal RoPE
+            temporal_index_map(List, optional): Custom temporal index for each sample
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -289,7 +294,7 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        q, k = rope_apply_qk(q, k, grid_sizes, freqs, frame_split_indices, ground_frame_indices)
+        q, k = rope_apply_qk(q, k, grid_sizes, freqs, frame_split_indices, ground_frame_indices, temporal_index_map)
 
         x = attention(
             q.to(dtype), 
@@ -345,6 +350,11 @@ class WanT2VCrossAttention(WanSelfAttention):
 
         context_part1 = context[:, :text_split_point]
         context_part2 = context[:, text_split_point:]
+        full_len = context.shape[1]
+        pad1 = context.new_zeros(b, full_len - text_split_point, context.shape[2])
+        context_part1 = torch.cat([context_part1, pad1], dim=1)
+        pad2 = context.new_zeros(b, text_split_point, context.shape[2])
+        context_part2 = torch.cat([context_part2, pad2], dim=1)
 
         q_front = self.norm_q(self.q(x_front.to(dtype))).view(b, -1, n, d)
         q_back = self.norm_q(self.q(x_back.to(dtype))).view(b, -1, n, d)
@@ -504,6 +514,7 @@ class WanAttentionBlock(nn.Module):
         ground_frame_indices=None,
         latent_split_point=None,
         text_split_point=None,
+        temporal_index_map=None,
     ):
         r"""
         Args:
@@ -527,7 +538,7 @@ class WanAttentionBlock(nn.Module):
         temp_x = self.norm1(x) * (1 + e[1]) + e[0]
         temp_x = temp_x.to(dtype)
 
-        y = self.self_attn(temp_x, seq_lens, grid_sizes, freqs, dtype, t=t, frame_split_indices=frame_split_indices, ground_frame_indices=ground_frame_indices)
+        y = self.self_attn(temp_x, seq_lens, grid_sizes, freqs, dtype, t=t, frame_split_indices=frame_split_indices, ground_frame_indices=ground_frame_indices, temporal_index_map=temporal_index_map)
         x = x + y * e[2]
 
         # cross-attention & ffn function
@@ -866,6 +877,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         ground_frame_indices=None,
         latent_split_point=None,
         text_split_point=None,
+        temporal_index_map=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1045,6 +1057,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                             ground_frame_indices,
                             latent_split_point,
                             text_split_point,
+                            temporal_index_map,
                             **ckpt_kwargs,
                         )
                     else:
@@ -1062,6 +1075,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                             ground_frame_indices=ground_frame_indices,
                             latent_split_point=latent_split_point,
                             text_split_point=text_split_point,
+                            temporal_index_map=temporal_index_map,
                         )
                         x = block(x, **kwargs)
 
@@ -1094,6 +1108,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                         ground_frame_indices,
                         latent_split_point,
                         text_split_point,
+                        temporal_index_map,
                         **ckpt_kwargs,
                     )
                 else:
@@ -1111,6 +1126,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                         ground_frame_indices=ground_frame_indices,
                         latent_split_point=latent_split_point,
                         text_split_point=text_split_point,
+                        temporal_index_map=temporal_index_map,
                     )
                     x = block(x, **kwargs)
 
