@@ -193,6 +193,25 @@ def load_cached_batch(batch, weight_dtype, device):
     return latents, prompt_embeds
 
 
+def _slerp_latent(v0, v1, t):
+    """Spherical linear interpolation between two latent tensors of the same shape."""
+    shape = v0.shape
+    v0_flat = v0.reshape(shape[0], -1)
+    v1_flat = v1.reshape(shape[0], -1)
+    v0_norm = F.normalize(v0_flat, dim=-1)
+    v1_norm = F.normalize(v1_flat, dim=-1)
+    dot = (v0_norm * v1_norm).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+    omega = torch.acos(dot)
+    sin_omega = torch.sin(omega)
+    linear_fallback = sin_omega.abs() < 1e-6
+    s0 = torch.sin((1.0 - t) * omega) / sin_omega
+    s1 = torch.sin(t * omega) / sin_omega
+    s0 = torch.where(linear_fallback, torch.tensor(1.0 - t, device=v0.device, dtype=v0.dtype), s0)
+    s1 = torch.where(linear_fallback, torch.tensor(t, device=v0.device, dtype=v0.dtype), s1)
+    result = s0 * v0_flat + s1 * v1_flat
+    return result.reshape(shape)
+
+
 def load_cached_singleturn_batch(batch, weight_dtype, device, refinement_mode=False):
     latent_key = "input_latents" if refinement_mode else "full_latents"
     full_latents = batch[latent_key].to(device=device, dtype=weight_dtype, non_blocking=True)
@@ -1015,6 +1034,26 @@ def parse_args():
         help="Disable RoPE temporal trick; use standard [0,1,2,...] indices instead of shared positions.",
     )
     parser.add_argument(
+        "--singleturn_rollout_reversed",
+        action="store_true",
+        help="Ablation: reverse the inner rollout frames (frames 3 to total-2) while keeping conditions and target pinned.",
+    )
+    parser.add_argument(
+        "--singleturn_rollout_shuffled",
+        action="store_true",
+        help="Ablation: apply a fixed shuffled permutation to the inner rollout frames (frames 3 to total-2).",
+    )
+    parser.add_argument(
+        "--singleturn_rollout_linear_interp",
+        action="store_true",
+        help="Ablation: replace inner frames with linear interpolation from source to target.",
+    )
+    parser.add_argument(
+        "--singleturn_rollout_slerp_interp",
+        action="store_true",
+        help="Ablation: replace inner frames with spherical linear interpolation from source to target.",
+    )
+    parser.add_argument(
         "--singleturn_refine_mode",
         action="store_true",
         help="Enable cached SingleTurn refinement training on coarse latent trajectories with a one-step tail correction target.",
@@ -1230,6 +1269,18 @@ def parse_args():
 
     if args.singleturn_refine_mode and not args.singleturn_mode:
         raise ValueError("SingleTurn refinement mode requires --singleturn_mode.")
+
+    if args.singleturn_rollout_reversed and args.singleturn_rollout_shuffled:
+        raise ValueError("--singleturn_rollout_reversed and --singleturn_rollout_shuffled are mutually exclusive.")
+
+    _rollout_ablation_flags = sum([
+        args.singleturn_rollout_reversed,
+        args.singleturn_rollout_shuffled,
+        args.singleturn_rollout_linear_interp,
+        args.singleturn_rollout_slerp_interp,
+    ])
+    if _rollout_ablation_flags > 1:
+        raise ValueError("Only one rollout ablation flag can be active at a time.")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
@@ -2205,6 +2256,15 @@ def main():
 
     idx_sampling = DiscreteSampling(args.train_sampling_steps, uniform_sampling=args.uniform_sampling)
 
+    _rollout_shuffle_perm = None
+    if args.singleturn_rollout_shuffled and args.singleturn_mode:
+        _num_inner = compute_singleturn_object_removal_total_frames(
+            args.singleturn_cache_corruption_frames,
+            args.singleturn_cache_restoration_frames,
+        ) - SINGLETURN_TAIL_START - 1
+        _shuffle_gen = torch.Generator().manual_seed(12345)
+        _rollout_shuffle_perm = torch.randperm(_num_inner, generator=_shuffle_gen)
+
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         if batch_sampler is not None and hasattr(batch_sampler, "sampler") and hasattr(batch_sampler.sampler, "generator"):
@@ -2544,6 +2604,22 @@ def main():
                     if args.low_vram and not args.enable_text_encoder_in_dataloader:
                         text_encoder.to('cpu')
                         torch.cuda.empty_cache()
+
+                if args.singleturn_mode and not args.singleturn_endpoint_mode:
+                    if args.singleturn_rollout_reversed:
+                        latents[:, :, SINGLETURN_TAIL_START:-1] = latents[:, :, SINGLETURN_TAIL_START:-1].flip(dims=[2])
+                    elif args.singleturn_rollout_shuffled:
+                        latents[:, :, SINGLETURN_TAIL_START:-1] = latents[:, :, SINGLETURN_TAIL_START:-1][:, :, _rollout_shuffle_perm]
+                    elif args.singleturn_rollout_linear_interp or args.singleturn_rollout_slerp_interp:
+                        _src = latents[:, :, SINGLETURN_SOURCE_CONDITION_FRAME_INDEX]
+                        _tgt = latents[:, :, -1]
+                        _num_inner = latents.shape[2] - SINGLETURN_TAIL_START - 1
+                        for _i in range(_num_inner):
+                            _alpha = float(_i + 1) / float(_num_inner + 1)
+                            if args.singleturn_rollout_linear_interp:
+                                latents[:, :, SINGLETURN_TAIL_START + _i] = (1.0 - _alpha) * _src + _alpha * _tgt
+                            else:
+                                latents[:, :, SINGLETURN_TAIL_START + _i] = _slerp_latent(_src, _tgt, _alpha)
 
                 bsz, channel, num_frames, height, width = latents.size()
                 if args.singleturn_refine_mode:

@@ -366,19 +366,7 @@ def _restore_generation_to_original_size(
         if frames.ndim != 5:
             raise ValueError(f"Expected frames with shape (B, C, T, H, W), got {tuple(frames.shape)}")
         frames = frames[..., top : top + resized_height, left : left + resized_width]
-        if resized_height == orig_height and resized_width == orig_width:
-            return frames
-        restored = []
-        for frame_idx in range(frames.shape[2]):
-            restored.append(
-                F.interpolate(
-                    frames[:, :, frame_idx],
-                    size=(orig_height, orig_width),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            )
-        return torch.stack(restored, dim=2)
+        return frames
 
     return {
         **generation,
@@ -729,6 +717,11 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
     results = []
     for index in tqdm(indices, desc="Running raw folder SingleTurn inference"):
         rel_triplet = triplets[index]
+        sample_generator = generator
+        if args.reset_seed_per_sample:
+            sample_generator = torch.Generator(
+                device=pipeline._execution_device
+            ).manual_seed(args.seed)
         image_path, mask_path, gt_path = _resolve_raw_folder_paths(args.raw_data_dir, rel_triplet)
         with Image.open(image_path) as image:
             original_size = image.size
@@ -750,7 +743,7 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
                 negative_prompt=args.negative_prompt,
                 guidance_scale=args.guidance_scale,
                 num_inference_steps=args.num_inference_steps,
-                generator=generator,
+                generator=sample_generator,
                 weight_dtype=weight_dtype,
                 total_frames=args.singleturn_total_frames,
                 enable_uncertainty_viz=args.enable_uncertainty_viz,
@@ -819,6 +812,11 @@ def _run_singleturn_raw_folder_mode(pipeline, args, weight_dtype, generator):
                 "prompt": CORNE_SINGLETURN_PROMPT,
                 "formatted_prompt": CORNE_SINGLETURN_PROMPT,
                 "seed": args.seed,
+                "seed_policy": (
+                    "fixed_reset_per_sample"
+                    if args.reset_seed_per_sample
+                    else "one_generator_per_process_advancing_across_samples"
+                ),
                 "num_inference_steps": args.num_inference_steps,
                 "guidance_scale": args.guidance_scale,
                 "sample_size": list(args.sample_size),
@@ -1272,6 +1270,11 @@ def parse_args():
         help="Letterboxed sample size used before VAE encode. Pass one value for square or two values for HEIGHT WIDTH.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument(
+        "--reset_seed_per_sample",
+        action="store_true",
+        help="Recreate the same seeded generator at the start of every raw-folder sample.",
+    )
     parser.add_argument("--fps", type=int, default=4, help="GIF playback FPS.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Inference weight dtype.")
     parser.add_argument(

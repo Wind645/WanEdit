@@ -6,23 +6,31 @@ export IMAGE_PATH=${IMAGE_PATH:-}
 export MASK_PATH=${MASK_PATH:-}
 export PROMPT=${PROMPT:-}
 export CACHED_SAMPLE_PATH=${CACHED_SAMPLE_PATH:-}
-export RAW_DATA_DIR=${RAW_DATA_DIR:-}
+export RAW_DATA_DIR=${RAW_DATA_DIR:-/mnt/cpfs/jiachengliu/code/object_removal/MaskBench/scribble_set}
 export RAW_SELECTED_TRIPLETS=${RAW_SELECTED_TRIPLETS:-}
-export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1}
+export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/ObjectClear_CORNE_60k_scribble_v1/cache/singleturn_objectclear_corne_60k_scribble_wan2.1_1.3b_keyframe_cache_v1}
+# export CACHED_DATA_DIR=${CACHED_DATA_DIR:-/mnt/cpfs/jiachengliu/dataset/CORNE/cache/singleturn_object_removal_wan2.1_1.3b_sam_strict_keyframe_cache_v1}
 export CACHED_DATA_META=${CACHED_DATA_META:-${CACHED_DATA_DIR}/manifest.json}
-export SHARED_PROMPT_CACHE=${SHARED_PROMPT_CACHE:-}
+export SHARED_PROMPT_CACHE=${SHARED_PROMPT_CACHE:-/mnt/cpfs/jiachengliu/code/object_removal/VideoCoF/WanEdit/t5_prompt_parts.pt}
 export CACHED_START_INDEX=${CACHED_START_INDEX:-0}
 export CACHED_NUM_SAMPLES=${CACHED_NUM_SAMPLES:-}
 export CACHED_NUM_WORKERS=${CACHED_NUM_WORKERS:-2}
 export CACHED_PREFETCH_FACTOR=${CACHED_PREFETCH_FACTOR:-2}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/twomask_condition}
-export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/nonlin_gamma1_5/checkpoint-1000/lora_diffusion_pytorch_model.safetensors}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/1.3b_validate}
+export LORA_PATH=${LORA_PATH:-/mnt/cpfs/jiachengliu/dataset/CORNE/ckpt/1.3B_ablation/no_rope/checkpoint-1800/lora_diffusion_pytorch_model.safetensors}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export ENABLE_REFINEMENT=${ENABLE_REFINEMENT:-0}
+export ENABLE_MASK_BLENDING=${ENABLE_MASK_BLENDING:-1}
 export MASK_BLEND_THRESHOLD=${MASK_BLEND_THRESHOLD:-0.5}
 export MASK_BLEND_DILATE_KERNEL_SIZE=${MASK_BLEND_DILATE_KERNEL_SIZE:-31}
 export MASK_BLEND_BLUR_KERNEL_SIZE=${MASK_BLEND_BLUR_KERNEL_SIZE:-15}
 export MASK_BLEND_BLUR_SIGMA=${MASK_BLEND_BLUR_SIGMA:-4.0}
+export ENABLE_UNCERTAINTY_VIZ=${ENABLE_UNCERTAINTY_VIZ:-0}
+export UNCERTAINTY_LAST_STEPS=${UNCERTAINTY_LAST_STEPS:-10}
+export ENABLE_TRAJECTORY_REFINEMENT=${ENABLE_TRAJECTORY_REFINEMENT:-0}
+export TRAJECTORY_REFINEMENT_REMAINING_STEPS=${TRAJECTORY_REFINEMENT_REMAINING_STEPS:-10}
+export TRAJECTORY_REFINEMENT_GAMMA=${TRAJECTORY_REFINEMENT_GAMMA:-}
+export TRAJECTORY_REFINEMENT_STRENGTH=${TRAJECTORY_REFINEMENT_STRENGTH:-1.0}
 export REFINEMENT_LORA_PATH=${REFINEMENT_LORA_PATH:-}
 export REFINEMENT_LORA_ALPHA=${REFINEMENT_LORA_ALPHA:-1.0}
 export REFINEMENT_GUIDANCE_SCALE=${REFINEMENT_GUIDANCE_SCALE:-1.0}
@@ -34,9 +42,13 @@ SAMPLE_HEIGHT=${SAMPLE_HEIGHT:-${SAMPLE_SIZE:-480}}
 SAMPLE_WIDTH=${SAMPLE_WIDTH:-${SAMPLE_SIZE:-832}}
 SINGLETURN_CACHE_CORRUPTION_FRAMES=${SINGLETURN_CACHE_CORRUPTION_FRAMES:-4}
 SINGLETURN_CACHE_RESTORATION_FRAMES=${SINGLETURN_CACHE_RESTORATION_FRAMES:-5}
-SINGLETURN_CACHE_INTERPOLATION_GAMMA=${SINGLETURN_CACHE_INTERPOLATION_GAMMA:-1.5}
-SINGLETURN_MASK_CONDITION_SOURCE=${SINGLETURN_MASK_CONDITION_SOURCE:-mask_check}
+SINGLETURN_CACHE_INTERPOLATION_GAMMA=${SINGLETURN_CACHE_INTERPOLATION_GAMMA:-1.2}
+SINGLETURN_MASK_CONDITION_SOURCE=${SINGLETURN_MASK_CONDITION_SOURCE:-mask_sam}
+SINGLETURN_ENDPOINT_MODE=${SINGLETURN_ENDPOINT_MODE:-0}
+ROLLBACK_CROSS_ATTN=${ROLLBACK_CROSS_ATTN:-1}
+ROLLBACK_ROPE=${ROLLBACK_ROPE:-1}
 SEED=${SEED:-0}
+RESET_SEED_PER_SAMPLE=${RESET_SEED_PER_SAMPLE:-0}
 FPS=${FPS:-4}
 DTYPE=${DTYPE:-bf16}
 ACCELERATE_MIXED_PRECISION=${ACCELERATE_MIXED_PRECISION:-bf16}
@@ -72,7 +84,58 @@ cmd_base=(
   --mask_blend_dilate_kernel_size "$MASK_BLEND_DILATE_KERNEL_SIZE"
   --mask_blend_blur_kernel_size "$MASK_BLEND_BLUR_KERNEL_SIZE"
   --mask_blend_blur_sigma "$MASK_BLEND_BLUR_SIGMA"
+  --uncertainty_last_steps "$UNCERTAINTY_LAST_STEPS"
+  --trajectory_refinement_remaining_steps "$TRAJECTORY_REFINEMENT_REMAINING_STEPS"
+  --trajectory_refinement_strength "$TRAJECTORY_REFINEMENT_STRENGTH"
 )
+
+if [[ "${ENABLE_MASK_BLENDING}" == "1" ]]; then
+  cmd_base+=(
+    --enable_mask_blending
+  )
+fi
+
+if [[ "${ENABLE_UNCERTAINTY_VIZ}" == "1" ]]; then
+  cmd_base+=(
+    --enable_uncertainty_viz
+  )
+fi
+
+if [[ "${ENABLE_TRAJECTORY_REFINEMENT}" == "1" ]]; then
+  cmd_base+=(
+    --enable_trajectory_refinement
+  )
+fi
+
+if [[ -n "${TRAJECTORY_REFINEMENT_GAMMA}" ]]; then
+  cmd_base+=(
+    --trajectory_refinement_gamma "$TRAJECTORY_REFINEMENT_GAMMA"
+  )
+fi
+
+if [[ "${SINGLETURN_ENDPOINT_MODE}" == "1" ]]; then
+  cmd_base+=(
+    --singleturn_endpoint_mode
+  )
+fi
+
+if [[ "${ROLLBACK_CROSS_ATTN}" == "1" ]]; then
+  cmd_base+=(
+    --rollback_cross_attn
+  )
+fi
+
+if [[ "${ROLLBACK_ROPE}" == "1" ]]; then
+  cmd_base+=(
+    --rollback_rope
+  )
+fi
+
+if [[ "${RESET_SEED_PER_SAMPLE}" == "1" ]]; then
+  cmd_base+=(
+    --reset_seed_per_sample
+  )
+fi
 
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   cmd=(
